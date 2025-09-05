@@ -9,30 +9,33 @@ class RAG():
         self.k=k
         self.path = path
         self.pipe_model = pipeline_model
-        self.pipe = get_pipeline(self.pipe_model)
+        self.pipe = get_pipeline(self.pipe_model, device)
 
         if method == 'BM25':
             self.model = BM25(k=self.k, path=self.path)
         elif method == 'BERT':
             self.model = BERT(k=self.k, device = "cuda:0" if torch.cuda.is_available() else "cpu", path=self.path)
-        else : 
-            raise NameError(f"Unknow '{method}' embedding method provided. Correct values are 'BERT' and 'BM25'")
+        else :
+            self.model = None
+            #raise NameError(f"Unknow '{method}' embedding method provided. Correct values are 'BERT' and 'BM25'")
         
     
-    def answer(self,query, doc = None):
+    def answer(self, query, doc=None):
         """
-        From an initial query, uses the LLM to get the answer to the query, with the context from the documents
+        From a query, either use RAG (with retrieval) or just send query to the LLM
         """
-        context_list = self.model.retrieve(query, path = self.path, doc = doc)['doc']
-        
+        context_list = []
+        if self.model is not None:  # only try retrieval if a model was set
+            try:
+                context_list = self.model.retrieve(query, path=self.path, doc=doc)['doc']
+            except Exception as e:
+                print(f"Retrieval failed: {e}")
+                context_list = []
 
         pipe_input = get_message(self.pipe_model, query, context_list)
-        print("Sending message")
-        print(pipe_input)
         try:
-            
             return self.pipe(pipe_input)[0]['generated_text'][1]['content'].split('\n')[0]
-        except : 
+        except:
             return self.pipe(pipe_input)[0]['generated_text'][1]['content']
 
 
@@ -55,20 +58,11 @@ def get_message(p_model, query, context_list):
     
     try : 
         
-        if len(context_list) != 0 :
-            context = '\nUse these informations to answer the question : '
-            for e in context_list:
-                context = context+'\n'+e
-
-            context=context[0]
-            message = [
-                {"role": "user", "content": str(query)+str(context)},
-                ]
-        else : 
-        
-            message = [
-                    {"role": "user", "content": str(query)},
-                    ]
+        if context_list and len(context_list) > 0:
+            context = "\nUse these informations to answer the question :\n" + "\n".join(context_list)
+            message = [{"role": "user", "content": f"{query}\n\n{context}"}]
+        else:
+            message = [{"role": "user", "content": str(query)}]
         return message
     except TypeError:
         return [
