@@ -1,0 +1,16 @@
+{
+  "created": "2025-09-05T18:26:02.107077Z",
+  "collection": "grid_ops",
+  "files": [
+    {
+      "path": "C:\\Users\\user\\Documents\\GitHub\\RAG-LLM\\database\\Embeddings.pdf",
+      "sha256": "b27ac9d873da7d2ccce7c862c75cce49104b4955daaed8fdc829c3697eb6b28c",
+      "chunks": 15
+    },
+    {
+      "path": "C:\\Users\\user\\Documents\\GitHub\\RAG-LLM\\database\\embeddings101.txt",
+      "sha256": "caa3da4167b245efbd5c269d89e9e5b72817f3bb7d0dfb51a3d00e8c1e0cc1a6",
+      "chunks": 1
+    }
+  ]
+}

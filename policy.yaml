@@ -1,0 +1,37 @@
+mode: monitor          # off | monitor | strict
+allow_collections: [grid_ops, safety_bulletins]   # retrieval allowlist
+output:
+  cite_or_silent: true
+  allow_general_if_no_docs: true      # let the LLM answer when no approved docs
+  auto_cite_if_missing: true          # add citations post-hoc if model forgets
+retrieval:
+  min_rel: 0.6                        # keep chunks ≥ 60% of top score
+  require_exact_terms: true           # only keep chunks with whole-word matches of query terms
+  max_chunks: 4                       # pass at most 4 chunks to the LLM
+logging:
+  path: ./logs/audit.jsonl
+  retention_days: 30
+  redact_fields: [user_query, tool_args]
+blocked_patterns:
+  prompt_injection:
+    - "(?i)ignore (all|any|previous|prior) (instructions|prompt)"
+    - "(?i)disclose|reveal (system|developer) prompt"
+    - "(?i)perform .* (curl|wget|powershell)"
+  pii:
+    - '\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}\b'
+    - '\b(\+352)?\s?\d{3}[\s.-]?\d{3}[\s.-]?\d{3}\b'
+
+  secrets:
+    - '(?i)api[_-]?key|token|secret'
+
+rbac:
+  roles:
+    analyst: { can_upload: false, can_use_tools: false }
+    admin:   { can_upload: true,  can_use_tools: true  }
+provider:
+  llm: "local"         # local | azure
+  azure_deployment: "" # fill if using Azure
+safe_mode: true         # no tools; retrieval only
+allow_dirs:
+  - "C:/Users/user/Documents/GitHub/RAG-LLM/database"
+  
