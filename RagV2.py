@@ -1,5 +1,7 @@
 # RagV2.py
 import os, re, torch
+from datetime import datetime
+from typing import Optional
 from transformers import pipeline
 from huggingface_hub import repo_exists
 
@@ -64,9 +66,37 @@ class RAG():
         else:
             self.model = None  # LLM-only
 
-    def answer(self, query, doc=None, role="analyst"):
+    def answer(self, query, doc=None, role="analyst", user_id=None, session_id=None):
+        # Initialize OpenTelemetry span for retrieval if available
+        retrieval_span_otel = None
+        retrieval_span_langfuse = None
+        try:
+            from observability.opentelemetry_integration import create_trace_span, set_span_attribute, OPENTELEMETRY_AVAILABLE
+            if OPENTELEMETRY_AVAILABLE:
+                retrieval_span_otel = create_trace_span(
+                    "retrieval",
+                    attributes={"span.type": "retriever", "span.name": "document_retrieval"}
+                )
+                retrieval_span_otel.__enter__()
+        except Exception:
+            pass
+        
+        # Fallback to direct Langfuse
+        if not retrieval_span_otel:
+            try:
+                from observability.langfuse_integration import get_langfuse_client, log_retrieval
+                langfuse = get_langfuse_client()
+                if langfuse:
+                    from langfuse.decorators import langfuse_context
+                    current_trace = getattr(langfuse_context, 'current_trace', None)
+                    if current_trace:
+                        retrieval_span_langfuse = current_trace
+            except Exception:
+                pass
+        
         # 1) Retrieve (prefer safe index)
         context_list, metas = [], []
+        retrieval_start = datetime.now()
 
         if safe_idx.records:
             params = POLICY.get("retrieval", {})
@@ -79,14 +109,52 @@ class RAG():
             )
             context_list = [t["text"] for t in top]
             metas = [t["meta"] for t in top]
+            
+            # Log retrieval to Langfuse
+            if retrieval_span:
+                try:
+                    from observability.langfuse_integration import log_retrieval
+                    scores = [t["meta"].get("score", 0.0) for t in top]
+                    log_retrieval(
+                        retrieval_span,
+                        name="safe_index_retrieval",
+                        query=query,
+                        documents=context_list,
+                        scores=scores,
+                        metadata={
+                            "collection": metas[0].get("collection", "unknown") if metas else "unknown",
+                            "retrieval_method": "safe_index"
+                        }
+                    )
+                except Exception:
+                    pass
         else:
             retrieval_ok = (self.model is not None and self.path and path_is_allowed(self.path))
             if retrieval_ok:
                 try:
                     ret = self.model.retrieve(query, path=self.path, doc=doc)
                     context_list = ret.get('doc') or ret.get('documents') or []
+                    scores = ret.get('score', [0.0] * len(context_list))
                     metas = [{"doc":"(legacy)", "chunk":i, "collection":"legacy"}
                              for i,_ in enumerate(context_list)]
+                    
+                    # Log retrieval to Langfuse
+                    if retrieval_span:
+                        try:
+                            from observability.langfuse_integration import log_retrieval
+                            log_retrieval(
+                                retrieval_span,
+                                name="legacy_retrieval",
+                                query=query,
+                                documents=context_list,
+                                scores=scores,
+                                metadata={
+                                    "retrieval_method": "legacy",
+                                    "method_type": str(type(self.model).__name__)
+                                }
+                            )
+                        except Exception:
+                            pass
                 except Exception as e:
                     print(f"[RAG] Retrieval failed: {e}")
                     context_list = []
@@ -107,10 +175,84 @@ class RAG():
         message = build_prompt(query, safe_chunks, metas)
 
         # 4) LLM call (with controlled generation)
+        # Check if pipeline is initialized
+        if self.pipe is None:
+            return "❌ **Error**: LLM model is not initialized. Please select an LLM model in the UI."
+        
+        # Convert chat format to string for pipeline
+        if isinstance(message, list) and len(message) > 0 and isinstance(message[0], dict):
+            # Extract content from chat format
+            prompt_text = message[0].get('content', '')
+        else:
+            prompt_text = message if isinstance(message, str) else str(message)
+        
+        if not prompt_text or prompt_text.strip() == "":
+            return "❌ **Error**: Empty prompt generated. Please try again."
+        
+        # Log LLM generation start
+        llm_start = datetime.now()
         try:
-            out = self.pipe(message, **self.gen_args)[0]['generated_text'][1]['content']
-        except Exception:
-            out = self.pipe(message, **self.gen_args)[0]['generated_text'][1]['content']
+            result = self.pipe(prompt_text, **self.gen_args)
+            # Handle pipeline output format: [{'generated_text': 'full_text_including_prompt'}]
+            if isinstance(result, list) and len(result) > 0:
+                if isinstance(result[0], dict) and 'generated_text' in result[0]:
+                    # Get the full generated text
+                    full_text = result[0]['generated_text']
+                    # Remove the input prompt from the output (pipeline includes it)
+                    # Try exact match first
+                    if full_text.startswith(prompt_text):
+                        out = full_text[len(prompt_text):].strip()
+                    else:
+                        # If prompt not at start, try to find and remove it (handles formatting differences)
+                        # Also handle cases where model adds formatting
+                        out = full_text
+                        # Try removing prompt if it appears anywhere
+                        prompt_clean = prompt_text.strip()
+                        if prompt_clean in out:
+                            # Find the position and take everything after
+                            idx = out.find(prompt_clean)
+                            if idx >= 0:
+                                out = out[idx + len(prompt_clean):].strip()
+                        # If still no change, use the full text (model might have reformatted)
+                        if out == full_text:
+                            # Last resort: try to extract just the new content
+                            # Look for common separators or just use everything
+                            out = full_text.strip()
+                else:
+                    out = str(result[0])
+            else:
+                out = str(result)
+            
+            # Log LLM generation to Langfuse if available
+            llm_end = datetime.now()
+            try:
+                from observability.langfuse_integration import get_langfuse_client, log_generation
+                from langfuse.decorators import langfuse_context
+                langfuse = get_langfuse_client()
+                if langfuse:
+                    current_trace = getattr(langfuse_context, 'current_trace', None)
+                    if current_trace:
+                        log_generation(
+                            current_trace,
+                            name="llm_generation",
+                            model=self.pipe_model,
+                            input_text=prompt_text,
+                            output_text=out,
+                            start_time=llm_start,
+                            end_time=llm_end,
+                            metadata={
+                                "max_new_tokens": self.gen_args.get("max_new_tokens"),
+                                "temperature": self.gen_args.get("temperature"),
+                                "has_context": bool(safe_chunks)
+                            }
+                        )
+            except Exception:
+                pass  # Langfuse logging is optional, fail silently
+        except Exception as e:
+            print(f"[RAG] LLM call failed: {e}")
+            import traceback
+            traceback.print_exc()
+            out = "I encountered an error generating a response. Please try again."
 
         # 5) Output cleanup & enforcement
         out = _clean_answer(redact(out))

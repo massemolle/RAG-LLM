@@ -1,0 +1,112 @@
+# PII Handling Rails
+# Comprehensive PII detection and redaction
+
+# Enhanced PII patterns (extensible for Presidio later)
+define flow detect and redact pii
+  $text = $input_text
+  
+  $pii_patterns = {
+    "email": {
+      "pattern": r'\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}\b',
+      "redaction": "[REDACTED_EMAIL]"
+    },
+    "phone_luxembourg": {
+      "pattern": r'\b(\+352)?\s?\d{3}[\s.-]?\d{3}[\s.-]?\d{3}\b',
+      "redaction": "[REDACTED_PHONE]"
+    },
+    "phone_international": {
+      "pattern": r'\b\+?\d{1,3}[\s.-]?\d{1,4}[\s.-]?\d{1,4}[\s.-]?\d{1,9}\b',
+      "redaction": "[REDACTED_PHONE]"
+    },
+    "credit_card": {
+      "pattern": r'\b\d{4}[\s.-]?\d{4}[\s.-]?\d{4}[\s.-]?\d{4}\b',
+      "redaction": "[REDACTED_CARD]"
+    },
+    "ssn": {
+      "pattern": r'\b\d{3}-\d{2}-\d{4}\b',
+      "redaction": "[REDACTED_SSN]"
+    },
+    "iban": {
+      "pattern": r'\b[A-Z]{2}\d{2}[A-Z0-9]{4}\d{7}([A-Z0-9]?){0,16}\b',
+      "redaction": "[REDACTED_IBAN]"
+    },
+    "passport": {
+      "pattern": r'\b[A-Z]{1,2}\d{6,9}\b',
+      "redaction": "[REDACTED_PASSPORT]"
+    }
+  }
+  
+  $redacted_text = $text
+  $pii_detected = []
+  
+  for $pii_type, $config in $pii_patterns.items():
+    $matches = re.findall($config["pattern"], $text, re.IGNORECASE)
+    if $matches:
+      $pii_detected.append($pii_type)
+      $redacted_text = re.sub(
+        $config["pattern"],
+        $config["redaction"],
+        $redacted_text,
+        flags=re.IGNORECASE
+      )
+  
+  return {
+    "text": $redacted_text,
+    "pii_types": $pii_detected,
+    "has_pii": len($pii_detected) > 0
+  }
+
+# Context-aware PII detection (placeholder for Presidio integration)
+define flow detect pii context aware
+  $text = $input_text
+  
+  # For now, use regex-based detection
+  # TODO: Integrate Presidio for context-aware detection
+  # Example: "my SSN is 123-45-6789" vs "SSN format is XXX-XX-XXXX"
+  
+  $result = execute detect and redact pii(text=$text)
+  
+  # Log PII detection
+  if $result.has_pii:
+    execute log_interaction(
+      event="pii_detected",
+      pii_types=$result.pii_types,
+      redacted=true
+    )
+  
+  return $result
+
+# PII in user input
+define flow check pii in input
+  user "..."
+  
+  $result = execute detect pii context aware(text=$user_message)
+  
+  if $result.has_pii:
+    # Redact from user message
+    $user_message = $result.text
+    # Log but don't block (we redact it)
+    execute log_interaction(
+      event="pii_in_input",
+      pii_types=$result.pii_types
+    )
+
+# PII in output (enforced)
+define flow enforce no pii in output
+  bot "..."
+  
+  $result = execute detect pii context aware(text=$bot_message)
+  
+  if $result.has_pii:
+    # Redact PII from output
+    $bot_message = $result.text
+    # Add note
+    $bot_message = $bot_message + "\n\n[Note: Personal information has been redacted for privacy and security]"
+    
+    # Log PII in output (security event)
+    execute log_interaction(
+      event="pii_in_output_redacted",
+      pii_types=$result.pii_types,
+      severity="high"
+    )
+

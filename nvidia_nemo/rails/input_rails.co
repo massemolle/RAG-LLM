@@ -1,0 +1,116 @@
+# Input Rails - First line of defense
+# Handles: prompt injection, jailbreak detection, input validation
+
+define user express greeting
+  "hello"
+  "hi"
+  "hey"
+
+define user ask question
+  "what is"
+  "tell me about"
+  "explain"
+  "how does"
+
+# Jailbreak detection patterns (heuristics-based)
+define flow check jailbreak attempt
+  user "..."
+  $jailbreak_patterns = [
+    "ignore previous instructions",
+    "ignore all previous instructions",
+    "disregard the above",
+    "forget everything above",
+    "you are now",
+    "pretend you are",
+    "act as if",
+    "simulate",
+    "roleplay",
+    "system prompt",
+    "developer mode",
+    "admin mode",
+    "bypass",
+    "override",
+    "jailbreak",
+    "dan mode",
+    "unrestricted",
+    "no restrictions",
+    "remove safety",
+    "disable safety"
+  ]
+  
+  $detected = false
+  $user_message_lower = $user_message.lower()
+  
+  for $pattern in $jailbreak_patterns:
+    if $pattern in $user_message_lower:
+      $detected = true
+      break
+  
+  if $detected:
+    bot refuse jailbreak attempt
+    stop
+
+define bot refuse jailbreak attempt
+  "I cannot and will not ignore my instructions or safety guidelines. Please rephrase your question in a respectful way."
+
+# Prompt injection detection
+define flow check prompt injection
+  user "..."
+  
+  $injection_patterns = [
+    "ignore",
+    "disregard",
+    "forget",
+    "reveal",
+    "disclose",
+    "show me",
+    "print",
+    "execute",
+    "run",
+    "perform",
+    "curl",
+    "wget",
+    "powershell",
+    "bash",
+    "python",
+    "javascript"
+  ]
+  
+  $user_message_lower = $user_message.lower()
+  $risk_score = 0
+  
+  for $pattern in $injection_patterns:
+    if $pattern in $user_message_lower:
+      $risk_score += 10
+  
+  if $risk_score >= 30:
+    bot refuse suspicious input
+    stop
+
+define bot refuse suspicious input
+  "Your input contains patterns that may be attempting to manipulate the system. Please rephrase your question."
+
+# Input length validation
+define flow validate input length
+  user "..."
+  
+  if len($user_message) > 2000:
+    bot refuse input too long
+    stop
+
+define bot refuse input too long
+  "Your question is too long. Please limit your query to 2000 characters."
+
+# Input sanitization
+define flow sanitize input
+  user "..."
+  
+  # Remove control characters
+  $sanitized = $user_message.replace("\x00", "")
+  $sanitized = $sanitized.replace("\r", "")
+  
+  # Normalize whitespace
+  $sanitized = " ".join($sanitized.split())
+  
+  $user_message = $sanitized
+

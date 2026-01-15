@@ -1,0 +1,35 @@
+# Main Rails Configuration
+# Combines all rail categories into a unified flow
+
+# Import all rail flows
+include rails/input_rails.co
+include rails/output_rails.co
+include rails/rag_flow.co
+include rails/jailbreak_detection.co
+include rails/tool_safety.co
+include rails/pii_handling.co
+include rails/monitoring.co
+
+# Main conversation flow
+define flow main
+  # Input rails (first line of defense)
+  check jailbreak attempt
+  check prompt injection
+  validate input length
+  sanitize input
+  
+  # RAG retrieval (with safety checks)
+  rag query
+  
+  # Generate response (through LLM)
+  # This will be handled by the integration code
+  
+  # Output rails (final safety checks)
+  check pii in output
+  enforce grounding
+  check response safety
+  validate output length
+  
+  # Log interaction
+  log interaction
+

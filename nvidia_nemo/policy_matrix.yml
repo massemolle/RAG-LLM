@@ -1,0 +1,166 @@
+# Policy Matrix Configuration
+# Maps (content_category, intent_class) -> (severity, response_mode, rationale)
+# This is the single source of truth for guardrails decisions
+
+policies:
+  # Help-seeking queries: ALLOWED
+  - category: harassment
+    intent: help_seeking
+    severity: allowed
+    response_mode: answer_normally
+    rationale: "Help-seeking query about harassment - provide supportive guidance"
+    confidence: 1.0
+  
+  - category: harassment
+    intent: reporting
+    severity: allowed
+    response_mode: escalate_or_resources
+    rationale: "Reporting query about harassment - provide resources and escalation"
+    confidence: 1.0
+  
+  - category: violence
+    intent: help_seeking
+    severity: allowed
+    response_mode: answer_normally
+    rationale: "Help-seeking query about violence - provide supportive guidance"
+    confidence: 1.0
+  
+  - category: self_harm
+    intent: help_seeking
+    severity: allowed
+    response_mode: escalate_or_resources
+    rationale: "Help-seeking query about self-harm - provide resources and hotlines"
+    confidence: 1.0
+  
+  - category: cyber_attack
+    intent: help_seeking
+    severity: allowed
+    response_mode: answer_normally
+    rationale: "Help-seeking query about cyber attacks - provide supportive guidance"
+    confidence: 1.0
+  
+  # Prevention/Education: ALLOWED (constrained)
+  - category: cyber_attack
+    intent: prevention
+    severity: allowed
+    response_mode: answer_safely_constrained
+    rationale: "Prevention/education query about cyber attacks - provide high-level guidance"
+    confidence: 1.0
+  
+  - category: violence
+    intent: prevention
+    severity: allowed
+    response_mode: answer_safely_constrained
+    rationale: "Prevention/education query about violence - provide high-level guidance"
+    confidence: 1.0
+  
+  - category: harassment
+    intent: prevention
+    severity: allowed
+    response_mode: answer_safely_constrained
+    rationale: "Prevention/education query about harassment - provide high-level guidance"
+    confidence: 1.0
+  
+  # Wrongdoing instructions: BLOCKED
+  - category: harassment
+    intent: wrongdoing_instructions
+    severity: blocked
+    response_mode: refuse_with_safe_alternatives
+    rationale: "Wrongdoing instruction query about harassment - block and provide safe alternatives"
+    confidence: 1.0
+  
+  - category: violence
+    intent: wrongdoing_instructions
+    severity: blocked
+    response_mode: refuse_with_safe_alternatives
+    rationale: "Wrongdoing instruction query about violence - block and provide safe alternatives"
+    confidence: 1.0
+  
+  - category: cyber_attack
+    intent: wrongdoing_instructions
+    severity: blocked
+    response_mode: refuse_with_safe_alternatives
+    rationale: "Wrongdoing instruction query about cyber attacks - block and provide safe alternatives"
+    confidence: 1.0
+  
+  - category: self_harm
+    intent: wrongdoing_instructions
+    severity: blocked
+    response_mode: refuse_with_safe_alternatives
+    rationale: "Wrongdoing instruction query about self-harm - block and provide safe alternatives"
+    confidence: 1.0
+  
+  # Evasion/Stealth: BLOCKED
+  - category: harassment
+    intent: evasion
+    severity: blocked
+    response_mode: refuse_with_safe_alternatives
+    rationale: "Evasion intent detected for harassment - block"
+    confidence: 1.0
+  
+  - category: cyber_attack
+    intent: evasion
+    severity: blocked
+    response_mode: refuse_with_safe_alternatives
+    rationale: "Evasion intent detected for cyber attacks - block"
+    confidence: 1.0
+  
+  # Targeting/Doxxing: BLOCKED
+  - category: pii_extraction
+    intent: targeting
+    severity: blocked
+    response_mode: refuse_with_safe_alternatives
+    rationale: "Targeting intent detected for PII extraction - block"
+    confidence: 1.0
+  
+  - category: doxxing
+    intent: doxxing
+    severity: blocked
+    response_mode: refuse_with_safe_alternatives
+    rationale: "Doxxing intent detected - block"
+    confidence: 1.0
+  
+  # Professional guidance: REVIEW
+  - category: unauthorized_medical
+    intent: professional_guidance_request
+    severity: review
+    response_mode: answer_safely_constrained
+    rationale: "Professional guidance request for medical - review with disclaimer"
+    confidence: 0.8
+  
+  - category: unauthorized_legal
+    intent: professional_guidance_request
+    severity: review
+    response_mode: answer_safely_constrained
+    rationale: "Professional guidance request for legal - review with disclaimer"
+    confidence: 0.8
+  
+  - category: unauthorized_financial
+    intent: professional_guidance_request
+    severity: review
+    response_mode: answer_safely_constrained
+    rationale: "Professional guidance request for financial - review with disclaimer"
+    confidence: 0.8
+  
+  # System exfiltration: BLOCKED
+  - category: system_exfil
+    intent: informational
+    severity: blocked
+    response_mode: refuse_with_safe_alternatives
+    rationale: "System exfiltration attempt - block"
+    confidence: 1.0
+  
+  # Ambiguous/Dual-use: REVIEW
+  - category: harassment
+    intent: ambiguous
+    severity: review
+    response_mode: answer_safely_constrained
+    rationale: "Ambiguous intent for harassment - review with constrained response"
+    confidence: 0.6
+  
+  - category: cyber_attack
+    intent: ambiguous
+    severity: review
+    response_mode: answer_safely_constrained
+    rationale: "Ambiguous intent for cyber attacks - review with constrained response"
+    confidence: 0.6

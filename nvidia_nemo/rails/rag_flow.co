@@ -1,0 +1,94 @@
+# RAG Flow - Controls retrieval and grounding
+# Integrates with existing RAG pipeline
+
+define flow rag query
+  user ask question
+  $query = $user_message
+  
+  # Validate query before retrieval
+  if len($query) < 3:
+    bot refuse query too short
+    stop
+  
+  # Call RAG retrieval (custom action)
+  $rag_result = execute retrieve_from_rag(query=$query)
+  
+  if $rag_result.error:
+    bot apologize retrieval error
+    stop
+  
+  # Check if documents were retrieved
+  if not $rag_result.has_documents:
+    # Check policy: allow general answers?
+    if $allow_general_if_no_docs:
+      $has_retrieved_docs = false
+      $citations_present = false
+      # Continue to LLM with no docs
+    else:
+      bot refuse no documents
+      stop
+  else:
+    $has_retrieved_docs = true
+    $retrieved_chunks = $rag_result.chunks
+    $retrieved_metas = $rag_result.metas
+    
+    # Validate retrieved chunks for safety
+    $safe_chunks = []
+    for $chunk in $retrieved_chunks:
+      $is_safe = execute validate_chunk(chunk=$chunk)
+      if $is_safe:
+        $safe_chunks.append($chunk)
+    
+    if len($safe_chunks) == 0:
+      bot refuse no safe documents
+      stop
+    
+    # Prepare context for LLM
+    $context = format_context(chunks=$safe_chunks, metas=$retrieved_metas)
+    $citations_present = true
+
+define bot refuse query too short
+  "Your question is too short. Please provide more details."
+
+define bot apologize retrieval error
+  "I encountered an error retrieving information. Please try again."
+
+define bot refuse no documents
+  "I cannot find relevant information in approved documents to answer your question. Please refine your query or add relevant documents."
+
+define bot refuse no safe documents
+  "The retrieved documents contain unsafe content and cannot be used. Please try a different query."
+
+# Context formatting with citations
+define function format_context(chunks, metas)
+  $formatted = ""
+  $i = 1
+  for $chunk, $meta in zip($chunks, $metas):
+    $doc_name = $meta.get("doc", "?")
+    $chunk_id = $meta.get("chunk", "?")
+    $formatted += f"[#{i} {doc_name}#{chunk_id}]\n{chunk}\n\n"
+    $i += 1
+  return $formatted
+
+# Retrieval quality gates
+define flow validate retrieval quality
+  $retrieved_chunks = $rag_result.chunks
+  $scores = $rag_result.scores
+  
+  # Check minimum relevance threshold
+  $min_score = max($scores) * 0.6  # 60% of top score
+  $filtered_chunks = []
+  
+  for $chunk, $score in zip($retrieved_chunks, $scores):
+    if $score >= $min_score:
+      $filtered_chunks.append($chunk)
+  
+  if len($filtered_chunks) == 0:
+    bot refuse low relevance
+    stop
+  
+  $retrieved_chunks = $filtered_chunks
+
+define bot refuse low relevance
+  "The retrieved documents are not relevant enough to answer your question. Please refine your query."
+

@@ -1,0 +1,95 @@
+# Output Rails - Final safety checks before response
+# Handles: PII suppression, grounding verification, response safety
+
+# PII Detection and Suppression
+define flow check pii in output
+  bot "..."
+  
+  $pii_patterns = {
+    "email": r'\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}\b',
+    "phone_lux": r'\b(\+352)?\s?\d{3}[\s.-]?\d{3}[\s.-]?\d{3}\b',
+    "phone_intl": r'\b\+?\d{1,3}[\s.-]?\d{1,4}[\s.-]?\d{1,4}[\s.-]?\d{1,9}\b',
+    "credit_card": r'\b\d{4}[\s.-]?\d{4}[\s.-]?\d{4}[\s.-]?\d{4}\b',
+    "ssn": r'\b\d{3}-\d{2}-\d{4}\b',
+    "iban": r'\b[A-Z]{2}\d{2}[A-Z0-9]{4}\d{7}([A-Z0-9]?){0,16}\b'
+  }
+  
+  $output_lower = $bot_message.lower()
+  $pii_found = false
+  
+  for $pii_type, $pattern in $pii_patterns.items():
+    if re.search($pattern, $bot_message, re.IGNORECASE):
+      $pii_found = true
+      # Replace with redaction
+      $bot_message = re.sub($pattern, "[REDACTED_" + $pii_type.upper() + "]", $bot_message, flags=re.IGNORECASE)
+  
+  if $pii_found:
+    $bot_message = $bot_message + "\n\n[Note: Personal information has been redacted for privacy]"
+
+# Grounding/Citation Enforcement for RAG
+define flow enforce grounding
+  bot "..."
+  
+  # Check if response should have citations
+  if $has_retrieved_docs and not $citations_present:
+    # Look for citation patterns
+    $citation_patterns = [
+      r'\[#\d+',
+      r'\[source',
+      r'\[doc',
+      r'\(source',
+      r'reference'
+    ]
+    
+    $has_citation = false
+    for $pattern in $citation_patterns:
+      if re.search($pattern, $bot_message, re.IGNORECASE):
+        $has_citation = true
+        break
+    
+    if not $has_citation:
+      # Refuse or hedge
+      bot refuse ungrounded response
+      stop
+
+define bot refuse ungrounded response
+  "I cannot provide an answer without proper source citations. The information must be verifiable from approved documents."
+
+# Response Safety Check
+define flow check response safety
+  bot "..."
+  
+  $unsafe_patterns = [
+    "ignore safety",
+    "bypass security",
+    "hack",
+    "exploit",
+    "vulnerability",
+    "malware",
+    "virus",
+    "trojan"
+  ]
+  
+  $bot_message_lower = $bot_message.lower()
+  $unsafe_detected = false
+  
+  for $pattern in $unsafe_patterns:
+    if $pattern in $bot_message_lower:
+      $unsafe_detected = true
+      break
+  
+  if $unsafe_detected:
+    bot refuse unsafe response
+    stop
+
+define bot refuse unsafe response
+  "I cannot provide information that could be used to compromise security. Please ask a different question."
+
+# Output length validation
+define flow validate output length
+  bot "..."
+  
+  if len($bot_message) > 5000:
+    # Truncate and add note
+    $bot_message = $bot_message[:5000] + "\n\n[Response truncated due to length]"
+

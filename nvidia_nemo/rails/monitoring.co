@@ -1,0 +1,127 @@
+# Monitoring and Telemetry Rails
+# Comprehensive logging and observability
+
+# Interaction logging
+define flow log interaction
+  $event_type = $event_type
+  $data = $event_data
+  
+  $log_entry = {
+    "timestamp": datetime.now().isoformat(),
+    "event": $event_type,
+    "user_id": $user_id,
+    "session_id": $session_id,
+    "data": $data
+  }
+  
+  execute log_interaction(
+    event=$event_type,
+    data=$log_entry
+  )
+
+# Security event logging
+define flow log security event
+  $event_type = $event_type
+  $severity = $severity
+  $details = $event_details
+  
+  $security_log = {
+    "timestamp": datetime.now().isoformat(),
+    "type": "security_event",
+    "event": $event_type,
+    "severity": $severity,
+    "user_id": $user_id,
+    "session_id": $session_id,
+    "details": $details,
+    "ip_address": $ip_address if $ip_address else "unknown"
+  }
+  
+  # Write to security log
+  execute write_security_log(entry=$security_log)
+  
+  # Alert if high severity
+  if $severity == "high":
+    execute send_alert(
+      level="high",
+      message=f"Security event: {event_type}",
+      details=$details
+    )
+
+# Performance monitoring
+define flow monitor performance
+  $operation = $operation_name
+  $start_time = $start_time
+  
+  $duration = time.now() - $start_time
+  
+  $metrics = {
+    "operation": $operation,
+    "duration_ms": $duration.total_seconds() * 1000,
+    "timestamp": datetime.now().isoformat()
+  }
+  
+  # Log if slow
+  if $duration.total_seconds() > 5.0:
+    execute log_interaction(
+      event="slow_operation",
+      data=$metrics
+    )
+  
+  return $metrics
+
+# Error tracking
+define flow track error
+  $error_type = $error_type
+  $error_message = $error_message
+  $stack_trace = $stack_trace if $stack_trace else None
+  
+  $error_log = {
+    "timestamp": datetime.now().isoformat(),
+    "type": "error",
+    "error_type": $error_type,
+    "message": $error_message,
+    "stack_trace": $stack_trace,
+    "user_id": $user_id,
+    "session_id": $session_id
+  }
+  
+  execute log_interaction(
+    event="error",
+    data=$error_log
+  )
+
+# Usage analytics
+define flow track usage
+  $action = $action_type
+  $metadata = $action_metadata
+  
+  $usage_log = {
+    "timestamp": datetime.now().isoformat(),
+    "action": $action,
+    "user_id": $user_id,
+    "session_id": $session_id,
+    "metadata": $metadata
+  }
+  
+  execute log_interaction(
+    event="usage",
+    data=$usage_log
+  )
+
+# Audit trail
+define flow create audit entry
+  $action = $action_name
+  $resource = $resource_name
+  $result = $action_result
+  
+  $audit_entry = {
+    "timestamp": datetime.now().isoformat(),
+    "user_id": $user_id,
+    "action": $action,
+    "resource": $resource,
+    "result": $result,
+    "ip_address": $ip_address if $ip_address else "unknown"
+  }
+  
+  execute write_audit_log(entry=$audit_entry)
+

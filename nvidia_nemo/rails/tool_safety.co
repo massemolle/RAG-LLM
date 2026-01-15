@@ -1,0 +1,107 @@
+# Tool/Action Safety Rails
+# Controls execution of tools and actions
+
+# Tool allowlist
+define flow check tool allowlist
+  $requested_tool = $tool_name
+  
+  $allowed_tools = [
+    "retrieve_from_rag",
+    "validate_chunk",
+    "format_context",
+    "log_interaction"
+  ]
+  
+  if $requested_tool not in $allowed_tools:
+    bot refuse unauthorized tool
+    stop
+
+define bot refuse unauthorized tool
+  "The requested tool is not authorized. Only approved tools can be executed."
+
+# Parameter validation for tools
+define flow validate tool parameters
+  $tool_name = $requested_tool
+  $params = $tool_params
+  
+  if $tool_name == "retrieve_from_rag":
+    # Validate query parameter
+    if "query" not in $params:
+      bot refuse missing parameter
+      stop
+    
+    $query = $params["query"]
+    if not isinstance($query, str):
+      bot refuse invalid parameter type
+      stop
+    
+    if len($query) > 2000:
+      bot refuse parameter too long
+      stop
+  
+  # Add validation for other tools as needed
+
+define bot refuse missing parameter
+  "Required parameters are missing for this tool."
+
+define bot refuse invalid parameter type
+  "Invalid parameter type provided to the tool."
+
+define bot refuse parameter too long
+  "Parameter value exceeds maximum length."
+
+# Tool execution monitoring
+define flow monitor tool execution
+  $tool_name = $requested_tool
+  $start_time = time.now()
+  
+  # Execute tool (with timeout)
+  try:
+    $result = execute $tool_name(**$tool_params)
+    $execution_time = time.now() - $start_time
+    
+    # Log execution
+    execute log_interaction(
+      event="tool_execution",
+      tool=$tool_name,
+      execution_time=$execution_time,
+      success=true
+    )
+    
+    return $result
+  except TimeoutError:
+    bot apologize tool timeout
+    stop
+  except Exception as e:
+    execute log_interaction(
+      event="tool_execution_error",
+      tool=$tool_name,
+      error=str(e),
+      success=false
+    )
+    bot apologize tool error
+    stop
+
+define bot apologize tool timeout
+  "The tool execution timed out. Please try again."
+
+define bot apologize tool error
+  "An error occurred while executing the tool. Please try again."
+
+# Rate limiting for tool calls
+define flow check tool rate limit
+  $tool_name = $requested_tool
+  $user_id = $user_id
+  
+  $rate_limit_key = f"{$user_id}:{$tool_name}"
+  $call_count = get_rate_limit_count($rate_limit_key)
+  
+  if $call_count >= 10:  # Max 10 calls per tool per user per minute
+    bot refuse rate limit exceeded
+    stop
+  
+  increment_rate_limit($rate_limit_key)
+
+define bot refuse rate limit exceeded
+  "You have exceeded the rate limit for this tool. Please wait before trying again."
+
