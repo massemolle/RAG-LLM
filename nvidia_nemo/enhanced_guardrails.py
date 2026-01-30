@@ -1,6 +1,13 @@
 """
-Enhanced Structured Guardrails with 3-Layer Defense and Full NeMo Integration
-Implements defense-in-depth for prompt injection/jailbreak detection
+Enhanced Structured Guardrails with Multi-Layer Defense
+
+Architecture (2026 State-of-the-Art):
+- Layer 0: Embedding Similarity (semantic attack detection)
+- Layer 1: LLM Guard (defensive scanners)
+- Layer 2: NeMo Guardrails (safety policies, topic control)
+- Layer 3: LLM Judge (escalation only)
+
+All layers are timed and transparent for monitoring.
 """
 
 import re
@@ -11,9 +18,44 @@ import time
 from datetime import datetime
 from typing import Dict, List, Optional, Any, Tuple
 from enum import Enum
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from concurrent.futures import ThreadPoolExecutor, as_completed, Future
+import threading
 
 logger = logging.getLogger(__name__)
+
+# Import new guardrails components
+ATTACK_EMBEDDINGS_AVAILABLE = False
+try:
+    from nvidia_nemo.attack_embeddings import (
+        get_attack_pattern_db, check_attack_similarity, 
+        AttackCategory, SimilarityResult
+    )
+    ATTACK_EMBEDDINGS_AVAILABLE = True
+    logger.info("Attack embeddings module loaded")
+except ImportError as e:
+    logger.warning(f"Attack embeddings not available: {e}")
+
+LLM_GUARD_INTEGRATION_AVAILABLE = False
+try:
+    from nvidia_nemo.llm_guard_integration import (
+        get_llm_guard, scan_input_text, scan_output_text,
+        LLMGuardResult, LLM_GUARD_AVAILABLE
+    )
+    LLM_GUARD_INTEGRATION_AVAILABLE = True
+    logger.info("LLM Guard integration loaded")
+except ImportError as e:
+    logger.warning(f"LLM Guard integration not available: {e}")
+
+TIMING_METRICS_AVAILABLE = False
+try:
+    from nvidia_nemo.timing_metrics import (
+        GuardrailsTimer, PipelineTiming, record_timing, get_timing_stats
+    )
+    TIMING_METRICS_AVAILABLE = True
+    logger.info("Timing metrics module loaded")
+except ImportError as e:
+    logger.warning(f"Timing metrics not available: {e}")
 
 try:
     from nemoguardrails import LLMRails, RailsConfig
@@ -63,6 +105,93 @@ class Severity(Enum):
     ALLOWED = "allowed"
     BLOCKED = "blocked"
     REVIEW = "review"
+    ESCALATE = "escalate"  # New: for LLM Judge escalation
+
+
+class TopicSeverity(Enum):
+    """Topic severity levels for categorization"""
+    RED = "red"        # Safety/Harm - immediate block
+    ORANGE = "orange"  # Legal/Governance - block with explanation
+    GREEN = "green"    # Social/Behavioral - review/constrain
+    YELLOW = "yellow"  # Criminal/Exploitation - block
+
+
+# Topic Taxonomy for NeMo Guardrails (2026)
+TOPIC_TAXONOMY = {
+    # RED - Safety/Harm (immediate block)
+    TopicSeverity.RED: {
+        "name": "Safety / Harm",
+        "topics": [
+            "chemical_biological_nuclear_weapons",
+            "illicit_drugs_production",
+            "physical_harm_instructions",
+            "malware_hacking_tools",
+            "cybercrime_intrusion",
+        ],
+        "patterns": [
+            r"(?i)\b(chemical|biological|nuclear)\s+(weapon|bomb|attack)",
+            r"(?i)\b(synthesize|make|create|produce)\s+(drug|narcotic|meth|cocaine|heroin|fentanyl)",
+            r"(?i)\b(how\s+to|instructions?\s+(for|to))\s+(hurt|harm|injure|kill|poison)",
+            r"(?i)\b(malware|virus|trojan|ransomware|keylogger|exploit|rootkit)",
+            r"(?i)\b(hack|breach|exploit|penetrate|intrude)\s+(into|system|network|server)",
+            r"(?i)\b(ddos|denial\s+of\s+service|sql\s+injection|xss|buffer\s+overflow)",
+        ]
+    },
+    # ORANGE - Legal/Governance (block with explanation)
+    TopicSeverity.ORANGE: {
+        "name": "Legal / Governance",
+        "topics": [
+            "copyright_violations",
+            "privacy_violations", 
+            "fraud_deception",
+            "unauthorized_expert_advice",
+            "government_decision_influence",
+        ],
+        "patterns": [
+            r"(?i)\b(copy|pirate|reproduce|steal)\s+(copyrighted|protected|licensed)",
+            r"(?i)\b(dox|doxx|expose|reveal)\s+(personal|private|address|identity)",
+            r"(?i)\b(scam|defraud|deceive|trick|con|phish)",
+            r"(?i)\b(medical|legal|financial)\s+(advice|diagnosis|prescription)",
+            r"(?i)\b(influence|manipulate|rig)\s+(election|vote|government|policy)",
+        ]
+    },
+    # GREEN - Social/Behavioral (review/constrain)
+    TopicSeverity.GREEN: {
+        "name": "Social / Behavioral",
+        "topics": [
+            "misinformation_disinformation",
+            "harassment_bullying",
+            "discrimination",
+            "sexual_adult_content",
+            "self_harm_encouragement",
+        ],
+        "patterns": [
+            r"(?i)\b(fake\s+news|disinformation|misinformation|propaganda|conspiracy)",
+            r"(?i)\b(harass|bully|stalk|threaten|intimidate|abuse)",
+            r"(?i)\b(racist|sexist|homophobic|discriminat)",
+            r"(?i)\b(explicit|pornograph|nsfw|adult\s+content)",
+            r"(?i)\b(self[- ]harm|suicide|cut\s+(myself|yourself)|end\s+(my|your)\s+life)",
+        ]
+    },
+    # YELLOW - Criminal/Exploitation (block)
+    TopicSeverity.YELLOW: {
+        "name": "Criminal / Exploitation",
+        "topics": [
+            "human_trafficking",
+            "illegal_weapons",
+            "violent_crime_assistance",
+            "extortion_blackmail",
+            "economic_harm",
+        ],
+        "patterns": [
+            r"(?i)\b(traffic|smuggle|exploit)\s+(human|person|people|child|minor)",
+            r"(?i)\b(illegal|unlicensed)\s+(weapon|firearm|gun|explosive)",
+            r"(?i)\b(how\s+to|plan|execute)\s+(rob|steal|kidnap|assault|murder)",
+            r"(?i)\b(extort|blackmail|ransom|threaten\s+to\s+expose)",
+            r"(?i)\b(launder|money\s+laundering|tax\s+evasion|embezzle|insider\s+trading)",
+        ]
+    },
+}
 
 
 @dataclass
@@ -350,6 +479,7 @@ Answer [Yes/No]:"""
         Returns: (severity, reason, triggered_categories)
         """
         # OpenTelemetry instrumentation
+        span = None  # Initialize span before try block
         try:
             from observability.opentelemetry_integration import get_tracer, set_span_attribute, OPENTELEMETRY_AVAILABLE
             if OPENTELEMETRY_AVAILABLE:
@@ -672,7 +802,7 @@ Answer [Yes/No]:"""
                 logger.warning(f"Rate limit exceeded for LLM self-check: {reason_msg}")
                 return Severity.ALLOWED, f"Layer C (LLM judge): Rate limited - assuming safe. {reason_msg}"
         
-        if not self.rag or not self.rag.pipe:
+        if not self.rag or not self.rag.llm_client:
             return Severity.ALLOWED, "Layer C (LLM judge): Not available - LLM not initialized. Assuming safe."
         
         start_time = time.time() if PRODUCTION_HARDENING_AVAILABLE else None
@@ -686,26 +816,13 @@ Answer [Yes/No]:"""
                 prompt = self.self_check_input_prompt.format(user_input=query)
                 max_tokens = 5  # Just need Yes/No
             
-            # Call LLM
-            result = self.rag.pipe(
+            # Call LLM using the client abstraction
+            response_text = self.rag.llm_client.generate(
                 prompt,
                 max_new_tokens=max_tokens,
                 temperature=0.0,   # Deterministic
-                do_sample=False,
-                pad_token_id=self.rag.pipe.tokenizer.eos_token_id if hasattr(self.rag.pipe, 'tokenizer') else None
+                do_sample=False
             )
-            
-            # Extract response
-            if isinstance(result, list) and len(result) > 0:
-                if isinstance(result[0], dict):
-                    response_text = result[0].get('generated_text', '')
-                    # Remove prompt from response
-                    if prompt in response_text:
-                        response_text = response_text.replace(prompt, '').strip()
-                else:
-                    response_text = str(result[0])
-            else:
-                response_text = str(result)
             
             # Try to parse as JSON if policy framework is available
             if POLICY_FRAMEWORK_AVAILABLE and hasattr(self, 'self_check_input_json_prompt'):
@@ -788,8 +905,8 @@ Answer [Yes/No]:"""
     
     def guard_input_security_3layer(self, query: str) -> GuardResult:
         """
-        Guard 2: Input Security with 3-layer defense
-        Now uses policy framework when available for intent-based decisions
+        NeMo input guardrails: 2-layer defense (Layer A + Layer B only).
+        Layer C (LLM judge) is handled at pipeline level when escalation is needed.
         """
         # Fast path: Allow short greetings without checking layers
         query_lower = query.lower().strip()
@@ -798,7 +915,7 @@ Answer [Yes/No]:"""
             return GuardResult(
                 guard_name="input-security",
                 severity=Severity.ALLOWED,
-                reason="3-layer defense evaluation. Short greeting detected - fast path allowed.",
+                reason="NeMo 2-layer evaluation. Short greeting detected - fast path allowed.",
                 triggered=True,
                 layers_triggered=["Fast path: Short greeting"]
             )
@@ -807,7 +924,7 @@ Answer [Yes/No]:"""
         if POLICY_FRAMEWORK_AVAILABLE and self.policy_matrix and self.content_classifier and self.intent_classifier:
             return self._guard_input_security_policy_framework(query)
         
-        # Legacy mode: 3-layer defense without policy framework
+        # Legacy mode: 2-layer defense (A + B only; no Layer C inside NeMo)
         layers_triggered = []
         layer_results = []
         
@@ -825,19 +942,7 @@ Answer [Yes/No]:"""
         if layer_b_sev != Severity.ALLOWED:
             layers_triggered.append("Layer B")
         
-        # Layer C: LLM judge (with routing and rate limiting)
-        # Extract user_id from context if available
-        user_id = getattr(self, '_current_user_id', None)
-        layer_c_result = self.layer_c_llm_judge(query, layer_a_result=layer_a_result,
-                                                layer_b_result=layer_b_result, user_id=user_id)
-        layer_c_sev, layer_c_reason = layer_c_result
-        layer_results.append(("Layer C", layer_c_sev, layer_c_reason))
-        if layer_c_sev != Severity.ALLOWED:
-            layers_triggered.append("Layer C")
-        
-        # Severity mapping: if any layer says BLOCK -> blocked
-        # if only heuristics/judge says suspicious -> review
-        # benign -> allowed
+        # Severity mapping: if any layer says BLOCK -> blocked; if only review -> review
         final_severity = Severity.ALLOWED
         if any(sev == Severity.BLOCKED for _, sev, _ in layer_results):
             final_severity = Severity.BLOCKED
@@ -847,9 +952,9 @@ Answer [Yes/No]:"""
         # Build reason explaining which layers fired
         if layers_triggered:
             reason_parts = [f"{layer}: {reason}" for layer, _, reason in layer_results if _ != Severity.ALLOWED]
-            reason = f"3-layer defense evaluation. {' | '.join(reason_parts)}"
+            reason = f"NeMo 2-layer evaluation. {' | '.join(reason_parts)}"
         else:
-            reason = "3-layer defense evaluation. All layers (A: deterministic, B: NeMo heuristics, C: LLM judge) determined input is safe."
+            reason = "NeMo 2-layer evaluation. All layers (A: deterministic, B: NeMo heuristics) determined input is safe."
         
         return GuardResult(
             guard_name="input-security",
@@ -880,14 +985,7 @@ Answer [Yes/No]:"""
         if layer_a_sev != Severity.BLOCKED or layer_a_sev == Severity.BLOCKED and len(layer_a_cats) == 0:
             layer_b_result = self.layer_b_nemo_heuristics(query, layer_a_result=layer_a_result)
         
-        # Only run Layer C if intent is ambiguous or confidence is low
-        layer_c_result = None
-        if intent_confidence < 0.7 or intent_class == IntentClass.AMBIGUOUS:
-            user_id = getattr(self, '_current_user_id', None)
-            layer_c_result = self.layer_c_llm_judge(query, layer_a_result=layer_a_result,
-                                                    layer_b_result=layer_b_result, user_id=user_id)
-        
-        # Step 4: Lookup policy decision
+        # Step 4: Lookup policy decision (Layer C / LLM judge is at pipeline level when escalated)
         if category_enums:
             policy_decision = self.policy_matrix.lookup_multiple(category_enums, intent_class)
         else:
@@ -924,22 +1022,20 @@ Answer [Yes/No]:"""
                         confidence=1.0
                     )
         
-        # Step 5: Build reason string (maintain exact format)
+        # Step 5: Build reason string (2-layer NeMo + policy)
         category_names = [cat.value for cat in category_enums] if category_enums else ["none"]
         reason_parts = [
-            f"3-layer defense evaluation.",
+            f"NeMo 2-layer evaluation.",
             f"Policy framework: Categories: {', '.join(category_names)}, Intent: {intent_class.value} (confidence: {intent_confidence:.2f})",
             f"Policy decision: {policy_decision.severity.value} - {policy_decision.rationale}"
         ]
         
-        # Add layer contributions
+        # Add layer contributions (A + B only)
         layer_contributions = []
         if layer_a_sev != Severity.ALLOWED:
             layer_contributions.append(f"Layer A: {layer_a_reason[:150]}")
         if layer_b_result and layer_b_result[0] != Severity.ALLOWED:
             layer_contributions.append(f"Layer B: {layer_b_result[1][:150]}")
-        if layer_c_result and layer_c_result[0] != Severity.ALLOWED:
-            layer_contributions.append(f"Layer C: {layer_c_result[1][:150]}")
         
         if layer_contributions:
             reason_parts.append(f"Layer signals: {' | '.join(layer_contributions)}")
@@ -951,8 +1047,6 @@ Answer [Yes/No]:"""
             layers_triggered.append("Layer A")
         if layer_b_result and layer_b_result[0] != Severity.ALLOWED:
             layers_triggered.append("Layer B")
-        if layer_c_result and layer_c_result[0] != Severity.ALLOWED:
-            layers_triggered.append("Layer C")
         layers_triggered.append("Policy Framework")
         
         return GuardResult(
@@ -1330,28 +1424,18 @@ Answer [Yes/No]:"""
     
     def _llm_check_output(self, response: str) -> Tuple[Severity, str]:
         """LLM self-check for output"""
-        if not self.rag or not self.rag.pipe:
+        if not self.rag or not self.rag.llm_client:
             return Severity.ALLOWED, "LLM self-check not available."
         
         try:
             prompt = self.self_check_output_prompt.format(user_input="[query]", bot_response=response)
-            result = self.rag.pipe(
+            # Call LLM using the client abstraction
+            response_text = self.rag.llm_client.generate(
                 prompt, 
                 max_new_tokens=5,  # Just need Yes/No
                 temperature=0.0,   # Deterministic
-                do_sample=False,
-                pad_token_id=self.rag.pipe.tokenizer.eos_token_id if hasattr(self.rag.pipe, 'tokenizer') else None
+                do_sample=False
             )
-            
-            if isinstance(result, list) and len(result) > 0:
-                if isinstance(result[0], dict):
-                    response_text = result[0].get('generated_text', '')
-                    if prompt in response_text:
-                        response_text = response_text.replace(prompt, '').strip()
-                else:
-                    response_text = str(result[0])
-            else:
-                response_text = str(result)
             
             response_text = response_text.upper().strip()
             
@@ -1510,33 +1594,48 @@ I can help you find specific resources based on your situation. Please let me kn
         Get direct LLM response without RAG retrieval
         Used when cite_or_silent is disabled or when RAG is not available
         """
-        if not self.rag or not self.rag.pipe:
+        if not self.rag or not self.rag.llm_client:
+            logger.error("LLM client not initialized")
             return "❌ **Error**: LLM model is not initialized. Please select an LLM model in the UI."
         
         try:
-            # Build a simple prompt without RAG context
-            prompt = f"User: {query}\n\nAssistant:"
+            # Check if using BeamStudio (API client) - needs chat format
+            from llm_client import BeamStudioClient
             
-            # Call LLM directly
-            result = self.rag.pipe(prompt, **self.rag.gen_args)
+            # Get clean gen_args - remove RAG-specific parameters
+            gen_args = {}
+            if hasattr(self.rag, 'gen_args') and self.rag.gen_args:
+                # Only copy supported parameters
+                for key in ['temperature', 'max_new_tokens', 'max_completion_tokens', 'top_p']:
+                    if key in self.rag.gen_args:
+                        gen_args[key] = self.rag.gen_args[key]
             
-            # Extract response
-            if isinstance(result, list) and len(result) > 0:
-                if isinstance(result[0], dict) and 'generated_text' in result[0]:
-                    full_text = result[0]['generated_text']
-                    if full_text.startswith(prompt):
-                        out = full_text[len(prompt):].strip()
-                    else:
-                        out = full_text.strip()
-                else:
-                    out = str(result[0])
+            logger.info(f"Direct LLM request: client_type={type(self.rag.llm_client).__name__}, query_len={len(query)}")
+            
+            if isinstance(self.rag.llm_client, BeamStudioClient):
+                # Use proper chat messages format for API
+                messages = [
+                    {"role": "system", "content": "You are a helpful assistant. Answer questions concisely and accurately. Be informative and supportive."},
+                    {"role": "user", "content": query}
+                ]
+                logger.debug(f"BeamStudio messages: {messages}")
+                out = self.rag.llm_client.generate(query, messages=messages, **gen_args)
             else:
-                out = str(result)
+                # Local model - use simple prompt
+                prompt = query
+                out = self.rag.llm_client.generate(prompt, **gen_args)
             
-            return out if out else "I apologize, but I couldn't generate a response. Please try again."
+            logger.info(f"Direct LLM response received: len={len(out) if out else 0}, empty={not out or out.strip() == ''}")
+            
+            if not out or out.strip() == "":
+                logger.warning("Direct LLM returned empty response")
+                return "I apologize, but I couldn't generate a response. Please try again."
+            
+            return out.strip()
         except Exception as e:
             logger.error(f"Direct LLM response failed: {e}", exc_info=True)
             return f"❌ **Error**: I encountered an error generating a response: {str(e)}. Please try again."
+    
     
     def _detect_obfuscation(self, text: str) -> bool:
         """Detect obfuscation attempts"""
@@ -1553,12 +1652,643 @@ I can help you find specific resources based on your situation. Please let me kn
                 return True
         return False
     
+    # ========== PARALLEL EXECUTION METHODS ==========
+    
+    def _run_input_guards_parallel(
+        self, 
+        query: str, 
+        timer: Optional[Any] = None,
+        user_id: Optional[str] = None
+    ) -> Tuple[List[GuardResult], bool, str, bool]:
+        """
+        Run all input guards in PARALLEL for maximum performance.
+        
+        Architecture:
+        - Layer 0: Embedding Similarity (~200ms)
+        - Layer 1: LLM Guard (~1300ms) - slowest, determines total time
+        - Layer 2a: Topic Taxonomy (~50ms)
+        - Layer 2b: Input Security 3-layer (~500ms)
+        - Input Sentimental (~10ms)
+        - Input Topic (~10ms)
+        
+        All run simultaneously. If any returns BLOCKED, we terminate early.
+        
+        Returns:
+            Tuple of (guard_results, is_blocked, block_reason, escalate_to_llm_judge)
+        """
+        start_time = time.time()
+        guard_results: List[GuardResult] = []
+        is_blocked = False
+        block_reason = ""
+        escalate_to_llm_judge = False
+        
+        # Thread-safe containers for results
+        results_lock = threading.Lock()
+        blocked_event = threading.Event()
+        
+        def run_guard(guard_func, guard_name: str, *args, **kwargs):
+            """Run a single guard and return result with timing."""
+            guard_start = time.time()
+            try:
+                result = guard_func(*args, **kwargs)
+                elapsed = (time.time() - guard_start) * 1000
+                logger.debug(f"Guard {guard_name} completed in {elapsed:.1f}ms")
+                return guard_name, result, elapsed
+            except Exception as e:
+                logger.error(f"Guard {guard_name} failed: {e}")
+                elapsed = (time.time() - guard_start) * 1000
+                return guard_name, GuardResult(
+                    guard_name=guard_name,
+                    severity=Severity.ALLOWED,
+                    reason=f"Guard failed with error: {str(e)[:100]}",
+                    triggered=False
+                ), elapsed
+        
+        # Define all guards to run in parallel
+        guards_to_run = []
+        
+        # Layer 0: Embedding Similarity
+        guards_to_run.append(("embedding-similarity", self.guard_embedding_similarity, (query,), {}))
+        
+        # Layer 1: LLM Guard
+        guards_to_run.append(("llm-guard", self.guard_llm_guard, (query,), {}))
+        
+        # Layer 2a: Topic Taxonomy
+        guards_to_run.append(("topic-taxonomy", self.guard_topic_taxonomy, (query,), {}))
+        
+        # Layer 2b: Input Security 3-layer
+        guards_to_run.append(("input-security", self.guard_input_security_3layer, (query,), {}))
+        
+        # Input Sentimental
+        guards_to_run.append(("input-sentimental", self.guard_input_sentimental, (query,), {}))
+        
+        # Input Topic
+        guards_to_run.append(("input-topic", self.guard_input_topic, (query,), {}))
+        
+        # Run all guards in parallel with timing
+        layer_timings = {}
+        parallel_start = time.time()
+        
+        with ThreadPoolExecutor(max_workers=6) as executor:
+            futures: Dict[Future, str] = {}
+            
+            for guard_name, guard_func, args, kwargs in guards_to_run:
+                future = executor.submit(run_guard, guard_func, guard_name, *args, **kwargs)
+                futures[future] = guard_name
+            
+            # Collect results as they complete
+            for future in as_completed(futures):
+                if blocked_event.is_set():
+                    # Already blocked, cancel remaining
+                    future.cancel()
+                    continue
+                
+                try:
+                    guard_name, result, elapsed = future.result(timeout=5.0)
+                    layer_timings[guard_name] = elapsed
+                    
+                    # Handle tuple results (embedding similarity, topic taxonomy)
+                    if isinstance(result, tuple):
+                        guard_result = result[0]
+                        should_escalate = result[1] if len(result) > 1 else False
+                    else:
+                        guard_result = result
+                        should_escalate = False
+                    
+                    with results_lock:
+                        guard_results.append(guard_result)
+                        
+                        # Check for immediate block
+                        if guard_result.severity == Severity.BLOCKED:
+                            is_blocked = True
+                            block_reason = guard_result.reason
+                            blocked_event.set()  # Signal other threads to stop
+                            logger.info(f"BLOCKED by {guard_name}: {block_reason[:100]}")
+                        
+                        # Check for escalation
+                        if guard_result.severity == Severity.REVIEW or \
+                           guard_result.severity == Severity.ESCALATE or \
+                           should_escalate:
+                            escalate_to_llm_judge = True
+                            logger.debug(f"Escalation triggered by {guard_name}")
+                
+                except Exception as e:
+                    logger.error(f"Future failed for {futures[future]}: {e}")
+        
+        # Calculate actual parallel execution time
+        parallel_duration = (time.time() - parallel_start) * 1000
+        total_time = (time.time() - start_time) * 1000
+        
+        # Log timing if timer available - record actual duration
+        if timer:
+            # Create a fake layer timing that records actual duration
+            from nvidia_nemo.timing_metrics import LayerTiming
+            layer_timing_obj = LayerTiming(
+                layer_name="parallel_input_guards",
+                start_time=parallel_start,
+                end_time=time.time(),
+                duration_ms=parallel_duration,
+                was_skipped=False,
+                was_cached=False,
+                result="BLOCKED" if is_blocked else ("ESCALATE" if escalate_to_llm_judge else "ALLOWED"),
+                details={"individual_timings": layer_timings}
+            )
+            timer.layers.append(layer_timing_obj)
+            # Log individual guard timings
+            for name, elapsed in layer_timings.items():
+                logger.debug(f"  {name}: {elapsed:.1f}ms")
+        
+        logger.info(f"Parallel input guards completed in {parallel_duration:.1f}ms (blocked={is_blocked}, escalate={escalate_to_llm_judge})")
+        
+        return guard_results, is_blocked, block_reason, escalate_to_llm_judge
+    
+    def _run_output_guards_parallel(
+        self,
+        query: str,
+        response: str,
+        has_citations: bool = False,
+        chunk_metadata: Optional[List] = None,
+        timer: Optional[Any] = None
+    ) -> List[GuardResult]:
+        """
+        Run all output guards in PARALLEL for maximum performance.
+        
+        Output guards:
+        - Output Differential Analysis
+        - Output Topic
+        - Output Integrity
+        - Output IP
+        - Output Global
+        
+        Returns:
+            List of GuardResult from all output guards
+        """
+        start_time = time.time()
+        guard_results: List[GuardResult] = []
+        results_lock = threading.Lock()
+        
+        if chunk_metadata is None:
+            chunk_metadata = []
+        
+        def run_guard(guard_func, guard_name: str, *args, **kwargs):
+            """Run a single guard and return result with timing."""
+            guard_start = time.time()
+            try:
+                result = guard_func(*args, **kwargs)
+                elapsed = (time.time() - guard_start) * 1000
+                logger.debug(f"Output guard {guard_name} completed in {elapsed:.1f}ms")
+                return guard_name, result, elapsed
+            except Exception as e:
+                logger.error(f"Output guard {guard_name} failed: {e}")
+                elapsed = (time.time() - guard_start) * 1000
+                return guard_name, GuardResult(
+                    guard_name=guard_name,
+                    severity=Severity.ALLOWED,
+                    reason=f"Guard failed with error: {str(e)[:100]}",
+                    triggered=False
+                ), elapsed
+        
+        # Define all output guards to run in parallel
+        guards_to_run = [
+            ("output-differential", self.guard_output_differential, (query, response), {}),
+            ("output-topic", self.guard_output_topic, (response, query), {}),
+            ("output-integrity", self.guard_output_integrity, (response, query), {"has_citations": has_citations}),
+            ("output-ip", self.guard_output_ip, (response, query), {"chunk_metadata": chunk_metadata}),
+            ("output-global", self.guard_output_global, (response, query), {}),
+        ]
+        
+        layer_timings = {}
+        parallel_start = time.time()
+        
+        with ThreadPoolExecutor(max_workers=5) as executor:
+            futures = {}
+            
+            for guard_name, guard_func, args, kwargs in guards_to_run:
+                future = executor.submit(run_guard, guard_func, guard_name, *args, **kwargs)
+                futures[future] = guard_name
+            
+            # Collect all results (no early termination for output - we want all results)
+            for future in as_completed(futures):
+                try:
+                    guard_name, result, elapsed = future.result(timeout=5.0)
+                    layer_timings[guard_name] = elapsed
+                    
+                    with results_lock:
+                        guard_results.append(result)
+                
+                except Exception as e:
+                    logger.error(f"Output future failed for {futures[future]}: {e}")
+        
+        # Calculate actual parallel execution time
+        parallel_duration = (time.time() - parallel_start) * 1000
+        total_time = (time.time() - start_time) * 1000
+        
+        # Log timing if timer available - record actual duration
+        if timer:
+            from nvidia_nemo.timing_metrics import LayerTiming
+            layer_timing_obj = LayerTiming(
+                layer_name="parallel_output_guards",
+                start_time=parallel_start,
+                end_time=time.time(),
+                duration_ms=parallel_duration,
+                was_skipped=False,
+                was_cached=False,
+                result="COMPLETED",
+                details={"individual_timings": layer_timings}
+            )
+            timer.layers.append(layer_timing_obj)
+            # Log individual guard timings
+            for name, elapsed in layer_timings.items():
+                logger.debug(f"  {name}: {elapsed:.1f}ms")
+        
+        logger.info(f"Parallel output guards completed in {parallel_duration:.1f}ms")
+        
+        return guard_results
+    
+    def _run_input_pipeline(
+        self,
+        query: str,
+        timer: Optional[Any] = None,
+        user_id: Optional[str] = None
+    ) -> Tuple[List[GuardResult], bool, str]:
+        """
+        Line A: Run input guards in parallel, then LLM Judge only if escalated.
+        Used for speculative parallel execution (runs in parallel with LLM call).
+        Returns: (input_guard_results, is_blocked, block_reason)
+        """
+        input_results, is_blocked, block_reason, escalate_to_llm_judge = self._run_input_guards_parallel(
+            query, timer, user_id
+        )
+        if is_blocked:
+            return input_results, is_blocked, block_reason
+        
+        if escalate_to_llm_judge:
+            if timer:
+                with timer.time_layer("layer_3_llm_judge") as layer_timing:
+                    judge_result = self.layer_c_llm_judge(query, user_id=user_id)
+                    input_results.append(GuardResult(
+                        guard_name="llm-judge",
+                        severity=Severity.BLOCKED if judge_result[0] == Severity.BLOCKED else Severity.ALLOWED,
+                        reason=judge_result[1],
+                        triggered=True,
+                        layers_triggered=["layer_3_llm_judge"]
+                    ))
+                    layer_timing.result = judge_result[0].value.upper()
+                    if judge_result[0] == Severity.BLOCKED:
+                        is_blocked = True
+                        block_reason = judge_result[1]
+            else:
+                judge_result = self.layer_c_llm_judge(query, user_id=user_id)
+                input_results.append(GuardResult(
+                    guard_name="llm-judge",
+                    severity=Severity.BLOCKED if judge_result[0] == Severity.BLOCKED else Severity.ALLOWED,
+                    reason=judge_result[1],
+                    triggered=True,
+                    layers_triggered=["layer_3_llm_judge"]
+                ))
+                if judge_result[0] == Severity.BLOCKED:
+                    is_blocked = True
+                    block_reason = judge_result[1]
+        
+        return input_results, is_blocked, block_reason
+    
+    def _run_llm_and_output_guards(
+        self,
+        query: str,
+        role: str,
+        user_id: Optional[str],
+        session_id: Optional[str],
+        timer: Optional[Any] = None
+    ) -> Tuple[str, List, bool, List[GuardResult]]:
+        """
+        Line B: Get LLM response (RAG or direct), then run output guards in parallel.
+        Used for speculative parallel execution (runs in parallel with input pipeline).
+        Returns: (response, chunk_metadata, has_citations, output_guard_results)
+        """
+        chunk_metadata = []
+        has_citations = False
+        response = ""
+        
+        if timer:
+            llm_start = time.time()
+        
+        try:
+            from defense.guards import POLICY
+            cite_or_silent = POLICY.get("output", {}).get("cite_or_silent", True)
+            
+            if not cite_or_silent:
+                logger.info("cite_or_silent is OFF - using direct LLM response (speculative)")
+                response = self._get_direct_llm_response(query)
+                has_citations = False
+            else:
+                logger.info("cite_or_silent is ON - using RAG (speculative)")
+                response = self.rag.answer(query, role=role, user_id=user_id, session_id=session_id)
+                citation_patterns = [r'\[#\d+', r'\[source', r'\(source', r'\[CITATIONS\]']
+                has_citations = any(re.search(pattern, response) for pattern in citation_patterns)
+                if not response or response.strip() == "":
+                    response = "I couldn't find relevant information in the approved sources. Please try a different question or add relevant documents."
+                if response:
+                    response = self._apply_retrieval_rails_to_response(response)
+        except Exception as e:
+            logger.error(f"RAG/LLM error in speculative path: {e}", exc_info=True)
+            from defense.guards import POLICY
+            cite_or_silent = POLICY.get("output", {}).get("cite_or_silent", True)
+            allow_general = POLICY.get("output", {}).get("allow_general_if_no_docs", True)
+            if not cite_or_silent or allow_general:
+                try:
+                    response = self._get_direct_llm_response(query)
+                except Exception as fallback_error:
+                    logger.error(f"Direct LLM fallback also failed: {fallback_error}")
+                    response = f"❌ **Error**: I encountered an error processing your request: {str(e)}. Please try again."
+            else:
+                response = f"❌ **Error**: I encountered an error processing your request: {str(e)}. Please try again."
+        
+        if timer:
+            llm_duration = (time.time() - llm_start) * 1000
+            from nvidia_nemo.timing_metrics import LayerTiming
+            timer.layers.append(LayerTiming(
+                layer_name="llm_generation",
+                start_time=llm_start,
+                end_time=time.time(),
+                duration_ms=llm_duration,
+                was_skipped=False,
+                was_cached=False,
+                result="OK",
+                details={}
+            ))
+        
+        output_results = self._run_output_guards_parallel(
+            query=query,
+            response=response,
+            has_citations=has_citations,
+            chunk_metadata=chunk_metadata,
+            timer=timer
+        )
+        return response, chunk_metadata, has_citations, output_results
+    
+    # ========== NEW LAYER 0: EMBEDDING SIMILARITY ==========
+    def guard_embedding_similarity(self, query: str) -> Tuple[GuardResult, bool]:
+        """
+        Layer 0: Semantic similarity detection for prompt injection attacks.
+        Uses BERT embeddings to detect attacks even when paraphrased.
+        
+        Returns:
+            Tuple of (GuardResult, should_escalate)
+        """
+        if not ATTACK_EMBEDDINGS_AVAILABLE:
+            return GuardResult(
+                guard_name="embedding-similarity",
+                severity=Severity.ALLOWED,
+                reason="Embedding similarity check skipped (module not available)",
+                triggered=False
+            ), False
+        
+        try:
+            result = check_attack_similarity(query)
+            
+            if result.is_attack:
+                # High similarity to known attack - immediate block
+                return GuardResult(
+                    guard_name="embedding-similarity",
+                    severity=Severity.BLOCKED,
+                    reason=f"Semantic attack detected. Category: {result.matched_category.value if result.matched_category else 'unknown'}. "
+                           f"Similarity: {result.max_similarity:.2f}",
+                    triggered=True,
+                    layers_triggered=["layer_0_embedding"]
+                ), False
+            elif result.should_escalate:
+                # Medium similarity - escalate to LLM judge
+                return GuardResult(
+                    guard_name="embedding-similarity",
+                    severity=Severity.ALLOWED,
+                    reason=f"Potential attack pattern detected. Category: {result.matched_category.value if result.matched_category else 'unknown'}. "
+                           f"Similarity: {result.max_similarity:.2f}. Escalating to LLM judge.",
+                    triggered=True,
+                    layers_triggered=["layer_0_embedding_escalate"]
+                ), True
+            else:
+                # Low similarity - allow
+                return GuardResult(
+                    guard_name="embedding-similarity",
+                    severity=Severity.ALLOWED,
+                    reason=f"No attack patterns detected. Max similarity: {result.max_similarity:.2f}",
+                    triggered=False
+                ), False
+                
+        except Exception as e:
+            logger.error(f"Embedding similarity check failed: {e}")
+            return GuardResult(
+                guard_name="embedding-similarity",
+                severity=Severity.ALLOWED,
+                reason=f"Embedding check error: {str(e)}. Continuing with other guards.",
+                triggered=False
+            ), False
+    
+    # ========== NEW LAYER 1: LLM GUARD ==========
+    def guard_llm_guard(self, query: str) -> GuardResult:
+        """
+        Layer 1: LLM Guard defensive scanners.
+        Includes prompt injection, toxicity, secrets, and invisible text detection.
+        """
+        if not LLM_GUARD_INTEGRATION_AVAILABLE:
+            return GuardResult(
+                guard_name="llm-guard",
+                severity=Severity.ALLOWED,
+                reason="LLM Guard check skipped (module not available)",
+                triggered=False
+            )
+        
+        try:
+            result = scan_input_text(query)
+            
+            if not result.is_safe:
+                # One or more scanners failed
+                failed_list = ", ".join(result.failed_scanners)
+                return GuardResult(
+                    guard_name="llm-guard",
+                    severity=Severity.BLOCKED,
+                    reason=f"LLM Guard blocked. Failed scanners: {failed_list}. "
+                           f"Risk score: {result.total_risk_score:.2f}",
+                    triggered=True,
+                    layers_triggered=["layer_1_llm_guard"] + result.failed_scanners
+                )
+            else:
+                return GuardResult(
+                    guard_name="llm-guard",
+                    severity=Severity.ALLOWED,
+                    reason=f"LLM Guard passed all scanners. Risk score: {result.total_risk_score:.2f}",
+                    triggered=False
+                )
+                
+        except Exception as e:
+            logger.error(f"LLM Guard check failed: {e}")
+            return GuardResult(
+                guard_name="llm-guard",
+                severity=Severity.ALLOWED,
+                reason=f"LLM Guard error: {str(e)}. Continuing with other guards.",
+                triggered=False
+            )
+    
+    # ========== NEW: OUTPUT DIFFERENTIAL ANALYSIS ==========
+    def guard_output_differential(self, query: str, response: str) -> GuardResult:
+        """
+        Output differential analysis: detect unexpected content in responses.
+        Flags responses that contain sensitive patterns not justified by the query.
+        """
+        # Patterns that should only appear if query justifies them
+        sensitive_patterns = {
+            "api_key": [
+                r"sk-[a-zA-Z0-9]{20,}",
+                r"AKIA[A-Z0-9]{16}",
+                r"[a-zA-Z0-9]{32,}(?=.*key)",
+            ],
+            "email": [
+                r"[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}",
+            ],
+            "phone": [
+                r"\b\d{3}[-.]?\d{3}[-.]?\d{4}\b",
+                r"\+\d{1,3}[-.\s]?\d{1,4}[-.\s]?\d{1,4}[-.\s]?\d{1,9}",
+            ],
+            "internal_path": [
+                r"/home/[a-zA-Z0-9_]+/",
+                r"C:\\\\Users\\\\[a-zA-Z0-9_]+",
+                r"/etc/[a-zA-Z0-9_/]+",
+            ],
+            "password": [
+                r"password\s*[:=]\s*['\"]?[a-zA-Z0-9!@#$%^&*]+['\"]?",
+            ],
+        }
+        
+        # Query topics that justify certain patterns
+        query_lower = query.lower()
+        justified_patterns = set()
+        
+        if any(word in query_lower for word in ["email", "contact", "address"]):
+            justified_patterns.add("email")
+        if any(word in query_lower for word in ["phone", "call", "number"]):
+            justified_patterns.add("phone")
+        if any(word in query_lower for word in ["api", "key", "token", "secret"]):
+            justified_patterns.add("api_key")
+        if any(word in query_lower for word in ["path", "directory", "folder", "file"]):
+            justified_patterns.add("internal_path")
+        
+        # Check for unjustified sensitive content
+        violations = []
+        
+        for pattern_type, patterns in sensitive_patterns.items():
+            if pattern_type in justified_patterns:
+                continue  # Query justifies this pattern
+            
+            for pattern in patterns:
+                if re.search(pattern, response, re.IGNORECASE):
+                    violations.append(pattern_type)
+                    break
+        
+        if violations:
+            return GuardResult(
+                guard_name="output-differential",
+                severity=Severity.REVIEW,
+                reason=f"Output contains unexpected sensitive patterns: {', '.join(violations)}. "
+                       f"Query did not justify these patterns.",
+                triggered=True
+            )
+        
+        # Check for significant topic drift
+        # If query is about one topic but response goes into completely different territory
+        query_topics = set()
+        response_topics = set()
+        
+        topic_keywords = {
+            "technical": ["code", "api", "function", "class", "method", "programming"],
+            "personal": ["name", "age", "address", "birthday", "ssn", "social security"],
+            "financial": ["bank", "account", "credit", "money", "payment", "salary"],
+            "medical": ["health", "medical", "doctor", "prescription", "diagnosis"],
+        }
+        
+        for topic, keywords in topic_keywords.items():
+            if any(kw in query_lower for kw in keywords):
+                query_topics.add(topic)
+            if any(kw in response.lower() for kw in keywords):
+                response_topics.add(topic)
+        
+        # If response introduces sensitive topics not in query
+        sensitive_topics = {"personal", "financial", "medical"}
+        new_sensitive = (response_topics & sensitive_topics) - query_topics
+        
+        if new_sensitive and not query_topics:
+            return GuardResult(
+                guard_name="output-differential",
+                severity=Severity.REVIEW,
+                reason=f"Response introduces unexpected sensitive topics: {', '.join(new_sensitive)}",
+                triggered=True
+            )
+        
+        return GuardResult(
+            guard_name="output-differential",
+            severity=Severity.ALLOWED,
+            reason="Output differential analysis passed. No unexpected content detected.",
+            triggered=False
+        )
+    
+    # ========== NEW: TOPIC TAXONOMY CHECK ==========
+    def guard_topic_taxonomy(self, query: str) -> Tuple[GuardResult, Optional[TopicSeverity]]:
+        """
+        Check query against the topic taxonomy for harmful content.
+        
+        Returns:
+            Tuple of (GuardResult, TopicSeverity or None)
+        """
+        query_lower = query.lower()
+        
+        for severity_level, category_info in TOPIC_TAXONOMY.items():
+            for pattern in category_info["patterns"]:
+                if re.search(pattern, query, re.IGNORECASE):
+                    category_name = category_info["name"]
+                    
+                    # Determine action based on severity
+                    if severity_level in [TopicSeverity.RED, TopicSeverity.YELLOW]:
+                        return GuardResult(
+                            guard_name="topic-taxonomy",
+                            severity=Severity.BLOCKED,
+                            reason=f"Query matches {category_name} ({severity_level.value}) topic. Pattern: {pattern[:50]}...",
+                            triggered=True,
+                            layers_triggered=[f"taxonomy_{severity_level.value}"]
+                        ), severity_level
+                    elif severity_level == TopicSeverity.ORANGE:
+                        return GuardResult(
+                            guard_name="topic-taxonomy",
+                            severity=Severity.BLOCKED,
+                            reason=f"Query matches {category_name} ({severity_level.value}) topic. This requires authorized expertise.",
+                            triggered=True,
+                            layers_triggered=[f"taxonomy_{severity_level.value}"]
+                        ), severity_level
+                    else:  # GREEN
+                        return GuardResult(
+                            guard_name="topic-taxonomy",
+                            severity=Severity.REVIEW,
+                            reason=f"Query matches {category_name} ({severity_level.value}) topic. Response will be constrained.",
+                            triggered=True,
+                            layers_triggered=[f"taxonomy_{severity_level.value}"]
+                        ), severity_level
+        
+        return GuardResult(
+            guard_name="topic-taxonomy",
+            severity=Severity.ALLOWED,
+            reason="Query does not match any harmful topic categories.",
+            triggered=False
+        ), None
+    
     def answer(self, query: str, role: str = "analyst", 
                user_id: Optional[str] = None,
                session_id: Optional[str] = None,
-               trace_name: str = "rag_query") -> Tuple[str, List[GuardResult], List[str]]:
+               trace_name: str = "rag_query") -> Tuple[str, List[GuardResult], List[str], Optional[Dict]]:
         """
-        Get answer with all 5 guards evaluated and full routing
+        Get answer with multi-layer defense and timing transparency.
+        
+        Speculative parallel execution (2026):
+        - Line A: Input guards (parallel) + LLM Judge only if escalated
+        - Line B: LLM call + output guards (as soon as response is ready)
+        - Both lines run in parallel. Answer is displayed only if input and output checks pass.
         
         Args:
             query: User query
@@ -1568,8 +2298,14 @@ I can help you find specific resources based on your situation. Please let me kn
             trace_name: Trace name for observability
         
         Returns:
-            Tuple of (response, guard_results, log_lines)
+            Tuple of (response, guard_results, log_lines, timing_info)
         """
+        # Initialize timing and start time for logging
+        start_time = datetime.now()
+        timer = None
+        if TIMING_METRICS_AVAILABLE:
+            timer = GuardrailsTimer(query)
+        
         # Initialize OpenTelemetry trace if available
         otel_trace = None
         langfuse_trace = None
@@ -1593,8 +2329,8 @@ I can help you find specific resources based on your situation. Please let me kn
                             "span.type": "trace"
                         }
                     )
-                    otel_trace.__enter__()  # Start the span
-                    set_span_attribute("query", query[:500])  # Truncate long queries
+                    otel_trace.__enter__()
+                    set_span_attribute("query", query[:500])
         except Exception as e:
             logger.debug(f"OpenTelemetry tracing not available: {e}")
         
@@ -1614,158 +2350,55 @@ I can help you find specific resources based on your situation. Please let me kn
         
         guard_results = []
         log_lines = []
-        start_time = datetime.now()
+        response = ""
+        chunk_metadata = []
+        has_citations = False
+        output_results = []
         
-        # Guard 1: Input Sentimental
-        result1 = self.guard_input_sentimental(query)
-        guard_results.append(result1)
-        log_lines.extend(result1.to_log_lines())
+        # ========== SPECULATIVE PARALLEL EXECUTION ==========
+        # Line A: Input guards + LLM Judge (if escalated)
+        # Line B: LLM call + output guards (as soon as response is ready)
+        # Both run in parallel for maximum efficiency. Display answer only if input and output are good.
+        logger.info(f"Running SPECULATIVE parallel: input pipeline || (LLM + output guards)")
         
-        # Guard 2: Input Security (3-layer defense)
-        result2 = self.guard_input_security_3layer(query)
-        guard_results.append(result2)
-        log_lines.extend(result2.to_log_lines())
-        
-        # Check if blocked - generate safe refusal but still run output rails
-        if result2.severity == Severity.BLOCKED:
-            # Generate safe refusal message based on policy framework if available
-            if POLICY_FRAMEWORK_AVAILABLE and self.policy_matrix and result2.layers_triggered and "Policy Framework" in result2.layers_triggered:
-                # Extract response mode from reason if available
-                if "Response mode: refuse_with_safe_alternatives" in result2.reason:
-                    response = self._generate_safe_refusal_with_alternatives(query, result2)
-                elif "Response mode: escalate_or_resources" in result2.reason:
-                    response = self._generate_escalation_response(query, result2)
-                else:
-                    response = "🚫 **Blocked by Guardrails**: Your input has been blocked due to security concerns. Please rephrase your question in a legitimate manner."
-            else:
-                response = "🚫 **Blocked by Guardrails**: Your input has been blocked due to security concerns. Please rephrase your question in a legitimate manner."
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            future_input = executor.submit(self._run_input_pipeline, query, timer, user_id)
+            future_llm = executor.submit(
+                self._run_llm_and_output_guards,
+                query, role, user_id, session_id, timer
+            )
             
-            # Still run input-topic guard
-            result3 = self.guard_input_topic(query)
-            guard_results.append(result3)
-            log_lines.extend(result3.to_log_lines())
+            # Wait for input pipeline (Line A)
+            input_results, is_blocked, block_reason = future_input.result()
             
-            # Skip RAG generation for blocked requests, but continue to output rails
-            # This ensures output guards are evaluated even for blocked requests
-            chunk_metadata = []
-            has_citations = False
-            # response already set above
-        else:
-            # Guard 3: Input Topic (only if not blocked)
-            result3 = self.guard_input_topic(query)
-            guard_results.append(result3)
-            log_lines.extend(result3.to_log_lines())
-            
-            # Dialog Rail: Route to appropriate handler
-            route = self.dialog_rail_routing(query)
-            
-            # Get response from RAG or direct LLM (based on cite_or_silent policy)
-            chunk_metadata = []
-            has_citations = False
+            # Wait for LLM + output pipeline (Line B); may have run in parallel with input
             try:
-                # Check policy for cite_or_silent
-                from defense.guards import POLICY
-                cite_or_silent = POLICY.get("output", {}).get("cite_or_silent", True)
-                allow_general = POLICY.get("output", {}).get("allow_general_if_no_docs", True)
-                
-                # If cite_or_silent is disabled, use direct LLM (no RAG retrieval)
-                if not cite_or_silent:
-                    logger.info("cite_or_silent is disabled - using direct LLM response")
-                    response = self._get_direct_llm_response(query)
-                    has_citations = False  # No citations for direct LLM responses
-                else:
-                    # cite_or_silent is enabled - use RAG with citation requirements
-                    # Call RAG.answer() - note: RAG.answer() signature is: answer(query, doc=None, role="analyst", user_id=None, session_id=None)
-                    # It does NOT accept trace_name, so we don't pass it
-                    response = self.rag.answer(query, role=role, user_id=user_id, session_id=session_id)
-                    
-                    # Check for citations
-                    citation_patterns = [r'\[#\d+', r'\[source', r'\(source', r'\[CITATIONS\]']
-                    has_citations = any(re.search(pattern, response) for pattern in citation_patterns)
-                    
-                    # Ensure we have a response
-                    if not response or response.strip() == "":
-                        logger.warning("RAG returned empty response")
-                        # If allow_general is true, try direct LLM as fallback
-                        if allow_general:
-                            response = self._get_direct_llm_response(query)
-                            has_citations = False
-                        else:
-                            response = "I apologize, but I couldn't generate a response. Please try rephrasing your question."
-                
-                # Apply retrieval rails: check response for injection patterns from retrieved chunks
-                # Only apply if we used RAG (not direct LLM)
-                if cite_or_silent:
-                    response = self._apply_retrieval_rails_to_response(response)
-            
+                response, chunk_metadata, has_citations, output_results = future_llm.result()
             except Exception as e:
-                logger.error(f"RAG error: {e}", exc_info=True)
-                import traceback
-                traceback.print_exc()
-                
-                # Check if we should try direct LLM response as fallback
-                from defense.guards import POLICY
-                cite_or_silent = POLICY.get("output", {}).get("cite_or_silent", True)
-                allow_general = POLICY.get("output", {}).get("allow_general_if_no_docs", True)
-                
-                # If cite_or_silent is disabled or allow_general is true, try direct LLM
-                if not cite_or_silent or allow_general:
-                    try:
-                        response = self._get_direct_llm_response(query)
-                        logger.info("Fell back to direct LLM response after RAG error")
-                        # Continue with output guards - don't return early
-                    except Exception as fallback_error:
-                        logger.error(f"Direct LLM fallback also failed: {fallback_error}")
-                        response = f"❌ **Error**: I encountered an error processing your request: {str(e)}. Please try again."
-                        guard_results.append(GuardResult(
-                            guard_name="output-topic",
-                            severity=Severity.ALLOWED,
-                            reason="Not evaluated - error occurred during response generation.",
-                            triggered=False
-                        ))
-                        guard_results.append(GuardResult(
-                            guard_name="output-global",
-                            severity=Severity.ALLOWED,
-                            reason="Not evaluated - error occurred during response generation.",
-                            triggered=False
-                        ))
-                        return response, guard_results, log_lines
-                else:
-                    # cite_or_silent is enabled and allow_general is false - must have RAG
-                    response = f"❌ **Error**: I encountered an error processing your request: {str(e)}. Please try again."
-                    guard_results.append(GuardResult(
-                        guard_name="output-topic",
-                        severity=Severity.ALLOWED,
-                        reason="Not evaluated - error occurred during response generation.",
-                        triggered=False
-                    ))
-                    guard_results.append(GuardResult(
-                        guard_name="output-global",
-                        severity=Severity.ALLOWED,
-                        reason="Not evaluated - error occurred during response generation.",
-                        triggered=False
-                    ))
-                    return response, guard_results, log_lines
-        
-        # Guard 4: Output Topic
-        result4 = self.guard_output_topic(response, query)
-        guard_results.append(result4)
-        log_lines.extend(result4.to_log_lines())
-        
-        # Guard 5: Output Integrity (Hallucinations, Unauthorized Advice)
-        result5 = self.guard_output_integrity(response, query, has_citations=has_citations)
-        guard_results.append(result5)
-        log_lines.extend(result5.to_log_lines())
-        
-        # Guard 6: Output IP (Copyright, Trade Secrets)
-        result6 = self.guard_output_ip(response, query, chunk_metadata=chunk_metadata)
-        guard_results.append(result6)
-        log_lines.extend(result6.to_log_lines())
-        
-        # Guard 7: Output Global (LLM self-check + general safety)
-        result7 = self.guard_output_global(response, query)
-        guard_results.append(result7)
-        log_lines.extend(result7.to_log_lines())
+                logger.error(f"LLM/output pipeline failed: {e}", exc_info=True)
+                response = f"❌ **Error**: I encountered an error processing your request: {str(e)}. Please try again."
+                output_results = [
+                    GuardResult(guard_name="output-topic", severity=Severity.ALLOWED,
+                                reason="Not evaluated - error during response generation.", triggered=False),
+                    GuardResult(guard_name="output-global", severity=Severity.ALLOWED,
+                                reason="Not evaluated - error during response generation.", triggered=False),
+                ]
+            
+            guard_results.extend(input_results)
+            for result in input_results:
+                log_lines.extend(result.to_log_lines())
+            
+            # If input blocked: discard LLM response and use block message
+            if is_blocked:
+                response = f"🚫 **Blocked by Guardrails**: {block_reason}"
+                # Still include output results for UI transparency
+                guard_results.extend(output_results)
+                for result in output_results:
+                    log_lines.extend(result.to_log_lines())
+            else:
+                guard_results.extend(output_results)
+                for result in output_results:
+                    log_lines.extend(result.to_log_lines())
         
         # Determine final response based on guard results
         blocked_count = sum(1 for r in guard_results if r.severity == Severity.BLOCKED)
@@ -1887,5 +2520,14 @@ I can help you find specific resources based on your situation. Please let me kn
             except Exception as e:
                 logger.debug(f"Failed to end OpenTelemetry trace: {e}")
         
-        return response, guard_results, log_lines
+        # Get timing summary
+        timing_info = None
+        if timer:
+            timing_summary = timer.get_summary()
+            timing_info = timing_summary.to_dict()
+            # Record to global aggregator
+            if TIMING_METRICS_AVAILABLE:
+                record_timing(timing_summary)
+        
+        return response, guard_results, log_lines, timing_info
 

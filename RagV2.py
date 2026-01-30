@@ -1,13 +1,19 @@
 # RagV2.py
 import os, re, torch
 from datetime import datetime
-from typing import Optional
+from typing import Optional, Union
 from transformers import pipeline
 from huggingface_hub import repo_exists
 
 from embedding import *  # your BM25/BERT classes
 from defense.guards import POLICY, gate_and_log, path_is_allowed, redact
 from defense.safe_retrieval import SafeIndex
+
+# Import LLM client abstraction
+from llm_client import (
+    LLMClient, LocalLLMClient, BeamStudioClient, 
+    get_llm_client, get_beamstudio_models, is_beamstudio_configured
+)
 
 __all__ = [
     "RAG",
@@ -16,6 +22,9 @@ __all__ = [
     "get_model_list",
     "list_devices",
     "safe_idx",
+    "get_llm_client",
+    "get_beamstudio_models",
+    "is_beamstudio_configured",
 ]
 
 def _clean_answer(text: str) -> str:
@@ -41,11 +50,29 @@ safe_idx = SafeIndex()
 class RAG():
     def __init__(self, method=None, k=5, path=None,
                  pipeline_model="Felladrin/Smol-Llama-101M-Chat-v1",
-                 device="cpu"):
+                 device="cpu",
+                 llm_client: Optional[LLMClient] = None):
         self.k = k
         self.path = path or "./database"
         self.pipe_model = pipeline_model
-        self.pipe = get_pipeline(self.pipe_model, device)
+        
+        # Use provided LLM client or create a local one
+        if llm_client is not None:
+            self.llm_client = llm_client
+            # For backward compatibility, set pipe to None if using API client
+            if isinstance(llm_client, BeamStudioClient):
+                self.pipe = None
+            else:
+                # LocalLLMClient has a pipeline property
+                self.pipe = getattr(llm_client, 'pipeline', None)
+        else:
+            # Legacy: create local pipeline directly
+            self.pipe = get_pipeline(self.pipe_model, device)
+            self.llm_client = LocalLLMClient(
+                model_name=self.pipe_model,
+                device=device,
+                pipeline_instance=self.pipe
+            )
 
         # sensible defaults for tiny models (helps avoid loops/nonsense)
         self.gen_args = {
@@ -111,12 +138,12 @@ class RAG():
             metas = [t["meta"] for t in top]
             
             # Log retrieval to Langfuse
-            if retrieval_span:
+            if retrieval_span_langfuse:
                 try:
                     from observability.langfuse_integration import log_retrieval
                     scores = [t["meta"].get("score", 0.0) for t in top]
                     log_retrieval(
-                        retrieval_span,
+                        retrieval_span_langfuse,
                         name="safe_index_retrieval",
                         query=query,
                         documents=context_list,
@@ -139,11 +166,11 @@ class RAG():
                              for i,_ in enumerate(context_list)]
                     
                     # Log retrieval to Langfuse
-                    if retrieval_span:
+                    if retrieval_span_langfuse:
                         try:
                             from observability.langfuse_integration import log_retrieval
                             log_retrieval(
-                                retrieval_span,
+                                retrieval_span_langfuse,
                                 name="legacy_retrieval",
                                 query=query,
                                 documents=context_list,
@@ -165,26 +192,29 @@ class RAG():
             return "Blocked: suspected prompt-injection. Please rephrase."
 
         has_docs = bool(safe_chunks)
-        allow_general = POLICY.get("output", {}).get("allow_general_if_no_docs", True)
+        cite_or_silent_early = POLICY.get("output", {}).get("cite_or_silent", True)
 
-        # If no docs and we require citations with no general answers -> refuse early
-        if (not has_docs and POLICY.get("output", {}).get("cite_or_silent", True) and not allow_general):
-            return "I can’t verify an answer from approved sources. Please add an approved document or refine the query."
+        # CITE-OR-SILENT early exit: If ON and no docs found, refuse immediately
+        if cite_or_silent_early and not has_docs:
+            return "I couldn't find relevant information in the approved sources to answer this question."
 
         # 3) Build prompt
         message = build_prompt(query, safe_chunks, metas)
 
         # 4) LLM call (with controlled generation)
-        # Check if pipeline is initialized
-        if self.pipe is None:
+        # Check if LLM client is initialized
+        if self.llm_client is None:
             return "❌ **Error**: LLM model is not initialized. Please select an LLM model in the UI."
         
-        # Convert chat format to string for pipeline
+        # Convert chat format to string for generation
         if isinstance(message, list) and len(message) > 0 and isinstance(message[0], dict):
             # Extract content from chat format
             prompt_text = message[0].get('content', '')
+            # Keep messages for API clients that support chat format
+            chat_messages = message
         else:
             prompt_text = message if isinstance(message, str) else str(message)
+            chat_messages = None
         
         if not prompt_text or prompt_text.strip() == "":
             return "❌ **Error**: Empty prompt generated. Please try again."
@@ -192,36 +222,12 @@ class RAG():
         # Log LLM generation start
         llm_start = datetime.now()
         try:
-            result = self.pipe(prompt_text, **self.gen_args)
-            # Handle pipeline output format: [{'generated_text': 'full_text_including_prompt'}]
-            if isinstance(result, list) and len(result) > 0:
-                if isinstance(result[0], dict) and 'generated_text' in result[0]:
-                    # Get the full generated text
-                    full_text = result[0]['generated_text']
-                    # Remove the input prompt from the output (pipeline includes it)
-                    # Try exact match first
-                    if full_text.startswith(prompt_text):
-                        out = full_text[len(prompt_text):].strip()
-                    else:
-                        # If prompt not at start, try to find and remove it (handles formatting differences)
-                        # Also handle cases where model adds formatting
-                        out = full_text
-                        # Try removing prompt if it appears anywhere
-                        prompt_clean = prompt_text.strip()
-                        if prompt_clean in out:
-                            # Find the position and take everything after
-                            idx = out.find(prompt_clean)
-                            if idx >= 0:
-                                out = out[idx + len(prompt_clean):].strip()
-                        # If still no change, use the full text (model might have reformatted)
-                        if out == full_text:
-                            # Last resort: try to extract just the new content
-                            # Look for common separators or just use everything
-                            out = full_text.strip()
-                else:
-                    out = str(result[0])
+            # Use the LLM client abstraction for generation
+            # Pass chat messages if available (for API clients), otherwise use prompt
+            if isinstance(self.llm_client, BeamStudioClient) and chat_messages:
+                out = self.llm_client.generate(prompt_text, messages=chat_messages, **self.gen_args)
             else:
-                out = str(result)
+                out = self.llm_client.generate(prompt_text, **self.gen_args)
             
             # Log LLM generation to Langfuse if available
             llm_end = datetime.now()
@@ -235,12 +241,13 @@ class RAG():
                         log_generation(
                             current_trace,
                             name="llm_generation",
-                            model=self.pipe_model,
+                            model=self.llm_client.model_name,
                             input_text=prompt_text,
                             output_text=out,
                             start_time=llm_start,
                             end_time=llm_end,
                             metadata={
+                                "provider": self.llm_client.provider,
                                 "max_new_tokens": self.gen_args.get("max_new_tokens"),
                                 "temperature": self.gen_args.get("temperature"),
                                 "has_context": bool(safe_chunks)
@@ -256,22 +263,35 @@ class RAG():
 
         # 5) Output cleanup & enforcement
         out = _clean_answer(redact(out))
+        
+        # Check if we actually got a meaningful response
+        if not out or out.strip() == "" or len(out.strip()) < 5:
+            if not has_docs:
+                return "I apologize, but I couldn't generate a response. Please try again."
+            else:
+                return "I couldn't find relevant information in the approved sources for this question."
 
-        # Auto-cite if model forgot citations
-        if (has_docs
+        # Get cite_or_silent setting
+        cite_or_silent = POLICY.get("output", {}).get("cite_or_silent", True)
+        
+        # CITE-OR-SILENT enforcement:
+        # If cite_or_silent is ON and docs were retrieved but LLM didn't cite them,
+        # the answer is NOT based on the corpus - refuse to answer
+        if cite_or_silent and has_docs and not re.search(r"\[#\d+", out):
+            return "I couldn't find relevant information in the approved sources to answer this question."
+        
+        # Auto-cite only if cite_or_silent is OFF (to help users see which docs were retrieved)
+        # When cite_or_silent is ON, we DON'T auto-cite because the LLM should naturally cite if relevant
+        if (not cite_or_silent
+            and has_docs
             and POLICY.get("output", {}).get("auto_cite_if_missing", True)
-            and not re.search(r"\[#\d+", out)):
+            and not re.search(r"\[#\d+", out)
+            and len(out.strip()) > 20):
             cites = " ".join(
                 f"[#{i} {m.get('doc','?')}#{m.get('chunk','?')}]"
                 for i, m in enumerate(metas[:3], 1)
             )
             out = f"{out}\n\n[CITATIONS] {cites}"
-
-        # Enforce cite-or-silent only when docs exist and still no citations
-        if (POLICY.get("output", {}).get("cite_or_silent", True)
-            and has_docs and not re.search(r"\[#\d+", out)):
-            out = ("I can’t verify an answer from approved sources. "
-                   "Please add an approved document or refine the query.")
 
         # Last-mile sanity for common off-topic constants
         if _offtopic_constants(query, out):
@@ -286,27 +306,41 @@ class RAG():
         return out
 
 def build_prompt(query, chunks, metas):
+    """Build a prompt for the LLM. Returns list of chat messages."""
     if chunks:
-        numbered=[]
+        # Format documents with citations
+        numbered = []
         for i, txt in enumerate(chunks, start=1):
-            meta = metas[i-1] if i-1 < len(metas) else {"doc":"?", "chunk":"?"}
+            meta = metas[i-1] if i-1 < len(metas) else {"doc": "?", "chunk": "?"}
             tag = f"[#{i} {meta.get('doc','?')}#{meta.get('chunk','?')}]"
             numbered.append(f"{tag}\n{str(txt)}")
         docs = "\n\n".join(numbered)
-        system = ("Prefer using the facts in <docs/> to answer. "
-                  "Quote supporting chunks inline as [#i doc#chunk]. "
-                  "If the docs do not contain the answer, you may answer generally; "
-                  "do not fabricate secrets or private data.")
-        return [{"role":"user","content": f"{system}\n\n<docs>\n{docs}\n</docs>\n\nQ: {query}"}]
+        
+        # System message with instructions
+        system_msg = (
+            "You are a helpful assistant that answers questions based on provided documents. "
+            "IMPORTANT: You MUST cite your sources using [#i doc#chunk] format. "
+            "If the documents do not contain relevant information, say so clearly."
+        )
+        
+        # User message with documents and question
+        user_msg = f"Documents:\n\n{docs}\n\nQuestion: {query}"
+        
+        return [
+            {"role": "system", "content": system_msg},
+            {"role": "user", "content": user_msg}
+        ]
     else:
+        # No documents available
         if POLICY.get("output", {}).get("allow_general_if_no_docs", True):
-            system = (
-                "You have no approved documents relevant to the question. "
-                "Answer briefly and factually. Prefer ranges and SI units. "
-                "If unknown, say what is typical. Do NOT mention speed of light unless asked."
-            )
-            return [{"role":"user","content": f"{system}\n\nQ: {query}"}]
-        return [{"role":"user","content": "I can’t verify an answer from approved sources."}]
+            return [
+                {"role": "system", "content": "You are a helpful assistant. Answer briefly and factually."},
+                {"role": "user", "content": query}
+            ]
+        return [
+            {"role": "system", "content": "You can only answer from approved sources."},
+            {"role": "user", "content": "I cannot answer this question as no approved sources are available."}
+        ]
 
 def get_pipeline(p_model, device='cuda:0'):
     device = "cuda:0" if torch.cuda.is_available() else "cpu"

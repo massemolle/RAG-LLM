@@ -3,9 +3,26 @@ import os, re, json, time, yaml, hashlib
 
 ROOT = os.path.dirname(os.path.dirname(__file__))
 
-with open(os.path.join(ROOT, "policy.yaml"), "r", encoding="utf-8") as f:
-    POLICY = yaml.safe_load(f)
+def _load_policy():
+    """Load policy from YAML file"""
+    with open(os.path.join(ROOT, "policy.yaml"), "r", encoding="utf-8") as f:
+        return yaml.safe_load(f)
 
+def reload_policy():
+    """Reload POLICY from disk - call this after saving policy.yaml"""
+    global POLICY, LOG_PATH
+    POLICY = _load_policy()
+    LOG_PATH = POLICY.get("logging", {}).get("path", "./logs/audit.jsonl")
+    os.makedirs(os.path.dirname(LOG_PATH), exist_ok=True)
+    return POLICY
+
+def update_cite_or_silent(value: bool):
+    """Update cite_or_silent in memory (without file I/O)"""
+    global POLICY
+    POLICY.setdefault("output", {})["cite_or_silent"] = value
+
+# Initial load
+POLICY = _load_policy()
 LOG_PATH = POLICY.get("logging", {}).get("path", "./logs/audit.jsonl")
 os.makedirs(os.path.dirname(LOG_PATH), exist_ok=True)
 
