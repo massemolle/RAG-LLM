@@ -308,8 +308,14 @@ def get_timing_aggregator() -> TimingAggregator:
 
 
 def record_timing(timing: PipelineTiming):
-    """Record timing to the global aggregator"""
+    """Record timing to the global aggregator and emit OCSF event"""
     get_timing_aggregator().record(timing)
+    # Emit OCSF Detection Finding to local JSONL log
+    try:
+        from observability.ocsf_mapper import pipeline_timing_obj_to_ocsf, emit_ocsf_event
+        emit_ocsf_event(pipeline_timing_obj_to_ocsf(timing))
+    except Exception:
+        pass  # OCSF emission is best-effort
 
 
 def get_timing_stats() -> Dict:

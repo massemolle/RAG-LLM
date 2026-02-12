@@ -1,0 +1,13 @@
+[general]
+email = ""
+
+[browser]
+gatherUsageStats = false
+
+[server]
+# HTTPS: self-signed certs (browsers will show security warning)
+sslCertFile = ".ssl/certchain.pem"
+sslKeyFile = ".ssl/private.key"
+enableCORS = false
+enableXsrfProtection = true
+runOnSave = false

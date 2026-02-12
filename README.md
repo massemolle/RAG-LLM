@@ -5,9 +5,102 @@ The aim of this README is to introduce you on how to use, maintain and improve t
 # 1. General Introduction
 
 ## Running the app
-The front page if in the 'stream.py' file, and you can run it with 'streamlit run stream.py'. The 'User' mode uses the BM25 method as it is currently the fastest available. The 'developper' mode allows the user to choose the embedding method and the LLM to be used.
+The main UI is in `streamv3.py`. Run it with:
+```bash
+streamlit run streamv3.py --server.port 8502
+```
+The 'User' mode uses the BM25 method as it is currently the fastest available. The 'developper' mode allows the user to choose the embedding method and the LLM to be used.
+
+## Guardrails Modes
+
+The application supports three guardrails modes, selectable via dropdown in the UI:
+
+| Mode | Description | Latency |
+|------|-------------|---------|
+| **Off** | No guardrails, direct LLM API call | Fastest |
+| **Classic** | LLM-as-judge only (5 judges: 3 input, 2 output) | Fast (~500-800ms) |
+| **Complete** | Full multi-layer pipeline with speculative parallel execution | Thorough (~1-2s) |
+
+### Complete Mode Architecture (Speculative Parallel)
+
+In Complete mode, **fast guards** and **LLM judges** run in parallel simultaneously:
+
+```
+┌──────────────────────────────────────────────────────────────┐
+│                   PARALLEL EXECUTION                          │
+│  ┌─────────────────────────┐  ┌────────────────────────────┐ │
+│  │ Fast Guards (~500ms)    │  │ LLM Judges (speculative)   │ │
+│  │ - Embedding similarity  │  │ - Input sentimental        │ │
+│  │ - LLM Guard            │  │ - Input security           │ │
+│  │ - NeMo Guardrails      │  │ - Input topic              │ │
+│  │ - Topic taxonomy       │  │                            │ │
+│  └─────────────────────────┘  └────────────────────────────┘ │
+└──────────────────────────────────────────────────────────────┘
+                          │
+                          ▼
+              ┌─────────────────────┐
+              │ Fast Guards Result? │
+              └─────────────────────┘
+                     │
+       ┌─────────────┼─────────────┐
+       ▼             ▼             ▼
+   All ALLOWED   Any BLOCKED   Any ESCALATE
+       │             │             │
+       ▼             ▼             ▼
+    VALID         BLOCKED      Use LLM Judge
+ (ignore LLM)                   Results
+```
+
+This architecture eliminates latency from LLM judge escalation since the judges are already running.
+
+## Deployment and HTTPS
+
+### Self-Signed Certificates (Development)
+
+Self-signed certificates are pre-generated in `.ssl/` and configured in `.streamlit/config.toml`. To regenerate:
+
+```bash
+openssl req -x509 -newkey rsa:4096 \
+  -keyout .ssl/private.key \
+  -out .ssl/certchain.pem \
+  -days 365 -nodes \
+  -subj "/CN=localhost/O=RAG-LLM/C=LU"
+```
+
+> **Note:** Browsers will show a security warning for self-signed certificates. Accept the warning to proceed.
+
+### Production HTTPS Options
+
+**Option A – Streamlit native SSL**  
+Edit `.streamlit/config.toml` and set the paths to your PEM certificate and key (e.g. Let's Encrypt):
+```toml
+[server]
+sslCertFile = "/path/to/certchain.pem"
+sslKeyFile = "/path/to/private.key"
+enableCORS = false
+enableXsrfProtection = true
+```
+Then run `streamlit run streamv3.py`; the app will serve over HTTPS.
+
+**Option B – Reverse proxy (recommended for production)**  
+Run Streamlit on HTTP (e.g. `localhost:8502`) and put a reverse proxy (nginx or Caddy) in front with TLS termination, proxying to `http://127.0.0.1:8502`. Add secure headers (e.g. `Strict-Transport-Security`, `X-Content-Type-Options`, `X-Frame-Options`) in the proxy config.
 
 # 2. Using and choosing a LLM model
+
+## BeamStudio (Cloud LLMs)
+
+The application supports BeamStudio cloud-hosted LLMs via the `llm_client.py` abstraction:
+
+| Model | Description | Notes |
+|-------|-------------|-------|
+| **gpt-5.1** | Latest reasoning model (default) | High token limit, best quality |
+| **gpt-4o** | Fast, efficient model | Good balance of speed/quality |
+| **gpt-5-mini** | Lightweight reasoning model | Temperature must be 1 (API constraint) |
+
+Select a model in the UI sidebar under "LLM Selection". BeamStudio requires setting the `BEAMSTUDIO_API_KEY` environment variable.
+
+## Local LLMs
+
 In this part, I will introduce both LM-studio and HuggingFace's transformers library to access frozen LLM model (i.e. fixed weights).
 
 ## LM-Studio

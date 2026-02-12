@@ -1,147 +1,123 @@
-# NVIDIA NeMo Guardrails Integration
+# NVIDIA NeMo Guardrails — RAG Integration
 
-This directory contains the NVIDIA NeMo Guardrails implementation for the RAG chatbot, providing comprehensive security and safety controls.
+This directory contains the production guardrails stack for the RAG chatbot: multi-layer input/output security, NeMo flows, policy framework, timing metrics, and observability (Langfuse/OpenTelemetry).
 
-## Structure
+---
+
+## Architecture Overview
+
+The pipeline uses **speculative parallel execution**:
+
+- **Line A (parallel):** Input guards (Layer 0 → Layer 1 → Layer 2 “NeMo”).
+- **Line B (parallel):** LLM generation.
+- When the LLM responds, **output guards** run in parallel.
+- **LLM Judge (Layer 3)** runs only on escalation from input guards; otherwise it is skipped.
+
+**Layers:**
+
+| Layer | Name | Role |
+|-------|------|------|
+| 0 | Embedding similarity | Semantic attack-pattern detection (optional) |
+| 1 | LLM Guard | Defensive scanners (prompt injection, toxicity, PII, etc.) |
+| 2 | NeMo (input guardrails) | 2-layer: deterministic patterns + NeMo jailbreak heuristics |
+| 3 | LLM Judge | Escalation-only model-based judge |
+| — | Output guards | Topic, PII, grounding, integrity, etc. |
+
+All layers are timed; metrics are exposed to the UI and to Langfuse/OpenTelemetry.
+
+---
+
+## Directory Layout
 
 ```
 nvidia_nemo/
 ├── config/
-│   └── config.yml          # Main guardrails configuration
-├── rails/
-│   ├── input_rails.co      # Input validation and jailbreak detection
-│   ├── output_rails.co     # Output safety and PII suppression
-│   ├── rag_flow.co         # RAG retrieval and grounding controls
-│   ├── tool_safety.co      # Tool/action execution safety
-│   ├── pii_handling.co     # PII detection and redaction
-│   ├── jailbreak_detection.co  # Advanced jailbreak heuristics
-│   └── monitoring.co       # Logging and telemetry
-├── logs/                   # Log files (auto-created)
-├── guardrails_integration.py  # Python integration code
-└── README.md               # This file
+│   ├── config.yml      # NeMo Guardrails config (models, rails, flows)
+│   ├── config.py       # Config loading helpers
+│   └── actions.py      # NeMo custom actions (RAG retrieve, validate_chunk, logging)
+├── rails/              # NeMo Colang flows
+│   ├── input_rails.co
+│   ├── output_rails.co
+│   ├── rag_flow.co
+│   ├── tool_safety.co
+│   ├── pii_handling.co
+│   ├── jailbreak_detection.co
+│   └── monitoring.co
+├── policy_matrix.yml   # Policy matrix (content × intent → decision)
+├── __init__.py
+├── README.md           # This file
+│
+├── enhanced_guardrails.py   # Main pipeline: layers 0–3, parallel guards, LLM call
+├── guardrails_integration.py # NeMo LLMRails + RAG (GuardedRAG, initialize_guardrails)
+├── guardrails_wrapper.py    # GuardrailsWrapper + GuardrailsStatus for UI
+├── timing_metrics.py       # PipelineTiming, LayerTiming, per-guard breakdown
+│
+├── attack_embeddings.py     # Layer 0: attack-pattern embeddings & similarity
+├── llm_guard_integration.py # Layer 1: llm-guard scan_input / scan_output
+├── jailbreak_heuristics.py  # NeMo-style length/perplexity, prefix/suffix (Layer 2)
+├── pii_detection.py         # PII detection/redaction (Presidio or regex)
+├── content_classifier.py    # ContentCategory detection from text
+├── policy_framework.py      # Policy matrix, IntentClass, ContentCategory, PolicyDecision
+├── unified_input_security.py # Intent-based guardrails using policy matrix
+├── structured_guardrails.py  # Structured guards with severity and logging
+├── retrieval_rails_integration.py # Chunk sanitization for RAG retrieval
+├── production_hardening.py   # Caching, rate limiting, model routing
+│
+└── test_guardrails.py       # Tests for guardrails behavior
 ```
 
-## Features
+---
 
-### 1. Input Rails (`input_rails.co`)
-- **Jailbreak Detection**: Heuristic-based detection of jailbreak attempts
-- **Prompt Injection Detection**: Pattern matching for injection attempts
-- **Input Validation**: Length checks, sanitization
-- **Input Sanitization**: Removes control characters, normalizes whitespace
+## File Reference
 
-### 2. Output Rails (`output_rails.co`)
-- **PII Suppression**: Detects and redacts PII in responses
-- **Grounding Enforcement**: Ensures citations are present for RAG answers
-- **Response Safety**: Checks for unsafe content
-- **Output Length Validation**: Prevents excessively long responses
+### Core pipeline and integration
 
-### 3. RAG Flow (`rag_flow.co`)
-- **Retrieval Control**: Validates queries before retrieval
-- **Quality Gates**: Enforces minimum relevance thresholds
-- **Citation Formatting**: Ensures proper citation format
-- **Document Safety**: Validates retrieved chunks
+- **`enhanced_guardrails.py`** — Central orchestration: runs Layer 0 (optional), Layer 1 (LLM Guard), Layer 2 (NeMo 2-layer: deterministic + jailbreak heuristics), then LLM call; runs input guards and LLM in parallel, then output guards. Hosts `guard_input_security_3layer` (actually 2-layer now), output guards (topic, PII, grounding, integrity), and the single LLM Judge step on escalation. Uses `timing_metrics` for per-layer and per-guard timings.
+- **`guardrails_integration.py`** — NeMo `LLMRails` setup and RAG wiring: `initialize_guardrails()`, `GuardedRAG`, custom actions (e.g. `retrieve_from_rag`, `validate_chunk`, logging). Connects `config/` and `rails/` to the RAG pipeline.
+- **`guardrails_wrapper.py`** — `GuardrailsWrapper` and `GuardrailsStatus`: status for UI (triggered guards, jailbreak/PII flags, grounding, risk score). Used by the Streamlit app for display.
 
-### 4. Tool Safety (`tool_safety.co`)
-- **Tool Allowlist**: Only approved tools can be executed
-- **Parameter Validation**: Validates tool parameters
-- **Rate Limiting**: Prevents tool abuse
-- **Execution Monitoring**: Tracks tool execution with timeouts
+### Timing and observability
 
-### 5. PII Handling (`pii_handling.co`)
-- **Comprehensive Detection**: Email, phone, credit cards, SSN, IBAN, passport
-- **Context-Aware Detection**: Placeholder for Presidio integration
-- **Input/Output Redaction**: Redacts PII in both input and output
-- **Logging**: Tracks PII detection events
+- **`timing_metrics.py`** — `PipelineTiming`, `LayerTiming`, `GuardrailsTimer`, `record_timing`, `get_timing_stats`. Tracks wall-clock per layer and per-guard; exposes “bottleneck” and “SKIPPED (no escalation)” for the LLM Judge. Consumed by the UI and by Langfuse/OpenTelemetry.
 
-### 6. Jailbreak Detection (`jailbreak_detection.co`)
-- **Multi-Pattern Detection**: Detects various jailbreak techniques
-- **Risk Scoring**: Assigns risk levels (low/medium/high)
-- **Obfuscation Detection**: Detects encoding/obfuscation attempts
-- **Semantic Detection**: Placeholder for embedding-based detection
+### Layers and guards
 
-### 7. Monitoring (`monitoring.co`)
-- **Interaction Logging**: Logs all interactions
-- **Security Events**: Tracks security-related events
-- **Performance Monitoring**: Tracks operation performance
-- **Error Tracking**: Comprehensive error logging
-- **Audit Trail**: Creates audit entries for compliance
+- **`attack_embeddings.py`** — Layer 0: attack-pattern embedding DB and similarity check (`check_attack_similarity`). Used when enabled for semantic attack detection.
+- **`llm_guard_integration.py`** — Layer 1: `llm-guard` (`scan_prompt`, `scan_output`) for prompt injection, toxicity, secrets, invisible text, etc. Wraps `scan_input_text` / `scan_output_text`.
+- **`jailbreak_heuristics.py`** — NeMo-style heuristics: length-per-perplexity and prefix/suffix perplexity (GPT-2). Used inside Layer 2 (NeMo) in `enhanced_guardrails`.
+- **`pii_detection.py`** — PII detection and redaction (Presidio if available, else regex). Used in input/output flows and retrieval.
+- **`content_classifier.py`** — Classifies text into `ContentCategory` (e.g. prompt_injection, jailbreak, violence, PII). Used by the policy framework.
+- **`policy_framework.py`** — `ContentCategory`, `IntentClass`, `ResponseMode`, `PolicyMatrix`, `PolicyDecision`, `IntentClassifier`. Loads `policy_matrix.yml` and drives intent-based decisions.
+- **`unified_input_security.py`** — Applies the policy matrix to input: content + intent → `PolicyDecision` / `GuardResult`. Can be used as an alternative or complement to the layered pipeline.
+- **`structured_guardrails.py`** — Structured guard runner with severity and standardized logging (`GuardResult`, log lines). Used for consistent guard interface and logs.
 
-## Usage
+### Retrieval and production
 
-### Basic Integration
+- **`retrieval_rails_integration.py`** — Sanitizes RAG chunks (instruction stripping, secret redaction). Used by retrieval flows and `validate_chunk`-style actions.
+- **`production_hardening.py`** — `GuardrailsCache`, rate limiter, model router; optional caching, per-IP/session limits, and escalation throttling.
 
-```python
-from RagV2 import RAG
-from nvidia_nemo.guardrails_integration import GuardedRAG
+### Config and rails
 
-# Initialize RAG
-rag = RAG(method='BM25', device='cpu')
+- **`config/config.yml`** — NeMo Guardrails: models, instructions, rails (input, output, retrieval, execution, monitoring), jailbreak thresholds.
+- **`config/actions.py`** — Custom NeMo actions: RAG retrieve, chunk validation, logging, security/audit writes, alerts. Used by Colang flows in `rails/`.
+- **`rails/*.co`** — Colang flows for input, output, RAG, tools, PII, jailbreak, monitoring. Referenced by `config.yml`.
 
-# Wrap with guardrails
-guarded_rag = GuardedRAG(rag)
+### Tests
 
-# Use guarded RAG
-response = guarded_rag.answer_sync(
-    query="What is an embedding?",
-    user_id="user123",
-    session_id="session456",
-    role="analyst"
-)
-```
+- **`test_guardrails.py`** — Tests for guardrails behavior (layers, blocking, timing, etc.).
 
-### Async Usage
+---
 
-```python
-import asyncio
+## Usage (high level)
 
-async def main():
-    guarded_rag = GuardedRAG(rag)
-    response = await guarded_rag.answer(
-        query="What is an embedding?",
-        user_id="user123"
-    )
-    print(response)
+- The **Streamlit app** (`streamv3.py`) and **RAG entrypoint** (`RagV2.py`) use `enhanced_guardrails` for the full pipeline (input guards || LLM → output guards, LLM Judge on escalation).
+- Observability is via **Langfuse and OpenTelemetry**; the old `logs/` folder and local `.log` files are obsolete.
+- For a “wrap RAG with NeMo only” usage, `GuardedRAG` and `initialize_guardrails()` in `guardrails_integration.py` provide the classic NeMo+RAG integration.
 
-asyncio.run(main())
-```
-
-## Configuration
-
-Edit `config/config.yml` to customize:
-- Model settings
-- Rail activation
-- Logging configuration
-- Policy settings
-
-## Custom Actions
-
-The integration provides these custom actions:
-- `retrieve_from_rag(query)`: Retrieves documents from RAG
-- `validate_chunk(chunk)`: Validates chunk safety
-- `log_interaction(event, data)`: Logs interactions
-- `write_security_log(entry)`: Writes security events
-- `write_audit_log(entry)`: Writes audit entries
-- `send_alert(level, message, details)`: Sends alerts
-
-## Logs
-
-Logs are written to:
-- `./logs/audit.jsonl`: General audit log
-- `./logs/security.jsonl`: Security events
-- `./logs/guardrails.log`: Guardrails system log
+---
 
 ## References
 
-- [NVIDIA NeMo Guardrails Documentation](https://docs.nvidia.com/nemo/guardrails)
-- [Guardrails Process](https://docs.nvidia.com/nemo/guardrails/latest/user-guides/guardrails-process.html)
-- [Configuration Guide](https://docs.nvidia.com/nemo/guardrails/latest/user-guides/configuration-guide.html)
-- [Jailbreak Detection](https://docs.nvidia.com/nemo/guardrails/latest/user-guides/jailbreak-detection.html)
-
-## Next Steps
-
-1. **Presidio Integration**: Replace regex PII detection with Presidio
-2. **Semantic Jailbreak Detection**: Implement embedding-based detection
-3. **Advanced Monitoring**: Integrate with ELK/Datadog
-4. **Alerting**: Connect to Slack/Teams/PagerDuty
-5. **Performance Optimization**: Add caching, async improvements
-
+- [NVIDIA NeMo Guardrails](https://docs.nvidia.com/nemo/guardrails)
+- [Guardrails process](https://docs.nvidia.com/nemo/guardrails/latest/user-guides/guardrails-process.html)
+- [Configuration guide](https://docs.nvidia.com/nemo/guardrails/latest/user-guides/configuration-guide.html)

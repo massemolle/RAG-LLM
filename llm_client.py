@@ -256,10 +256,16 @@ class BeamStudioClient(LLMClient):
             logger.warning("BeamStudio API key not configured. Set BEAMSTUDIO_API_KEY environment variable.")
         
         # Default generation parameters for API
+        # Note: Reasoning models (gpt-5.1, o1, etc.) use tokens for internal chain-of-thought
+        # before producing output, so we need higher limits (typically 500-2000+ for reasoning alone)
+        # Complex multi-part queries can consume 1500+ reasoning tokens
         self.default_gen_args = {
             "temperature": 0.7,
-            "max_completion_tokens": 500,
+            "max_completion_tokens": 4000,  # Very high for complex reasoning queries
         }
+        
+        # Store last token usage for display
+        self.last_usage = None
         
         logger.info(f"Initialized BeamStudio client: model={self._model}, base_url={self._base_url}")
     
@@ -366,6 +372,10 @@ class BeamStudioClient(LLMClient):
                 kwargs.pop(param, None)
                 gen_args.pop(param, None)
             
+            # Models that only support temperature=1 (BeamStudio API returns 400 otherwise)
+            if self._model and "gpt-5-mini" in self._model.lower():
+                gen_args["temperature"] = 1
+            
             # Build request body with only supported parameters
             body = {
                 "messages": messages,
@@ -375,7 +385,13 @@ class BeamStudioClient(LLMClient):
             # Add API version as query parameter
             params = {"api-version": self._api_version}
             
-            logger.debug(f"BeamStudio API request: endpoint={endpoint}, model={self._model}")
+            # Log the full request for debugging
+            logger.info(f"[BEAMSTUDIO_REQUEST] endpoint={endpoint}, model={self._model}")
+            logger.info(f"[BEAMSTUDIO_REQUEST] messages count={len(messages)}")
+            for i, msg in enumerate(messages):
+                content_preview = msg.get('content', '')[:100]
+                logger.info(f"[BEAMSTUDIO_REQUEST] message[{i}] role={msg.get('role')}, content={content_preview}...")
+            logger.info(f"[BEAMSTUDIO_REQUEST] gen_args={gen_args}")
             
             # Make API call
             response = requests.post(
@@ -401,30 +417,99 @@ class BeamStudioClient(LLMClient):
             # Parse response
             data = response.json()
             
+            # Log raw response for debugging
+            logger.info(f"BeamStudio raw API response keys: {data.keys() if isinstance(data, dict) else type(data)}")
+            
+            # Log prompt filter results (Azure content filter on INPUT)
+            if 'prompt_filter_results' in data:
+                logger.info(f"BeamStudio prompt_filter_results: {data['prompt_filter_results']}")
+            
+            if 'choices' in data:
+                logger.info(f"BeamStudio choices count: {len(data['choices'])}")
+                if len(data['choices']) > 0:
+                    choice = data['choices'][0]
+                    logger.info(f"BeamStudio first choice keys: {choice.keys() if isinstance(choice, dict) else type(choice)}")
+                    
+                    # Log content filter results if present
+                    if 'content_filter_results' in choice:
+                        logger.info(f"BeamStudio content_filter_results: {choice['content_filter_results']}")
+                    
+                    if 'message' in choice:
+                        msg = choice['message']
+                        logger.info(f"BeamStudio message keys: {msg.keys() if isinstance(msg, dict) else type(msg)}")
+                        
+                        # Log refusal if present
+                        if 'refusal' in msg:
+                            refusal_val = msg['refusal']
+                            logger.info(f"BeamStudio refusal field: '{refusal_val}' (type={type(refusal_val)})")
+                        
+                        if 'content' in msg:
+                            content_preview = msg['content'][:200] if msg['content'] else "(empty)"
+                            logger.info(f"BeamStudio content preview: {content_preview}")
+            
             # Extract generated text from OpenAI-format response
             if 'choices' in data and len(data['choices']) > 0:
                 choice = data['choices'][0]
-                if 'message' in choice and 'content' in choice['message']:
-                    output = choice['message']['content']
+                if 'message' in choice:
+                    msg = choice['message']
+                    
+                    # Check for refusal (Azure content filter)
+                    refusal = msg.get('refusal')
+                    if refusal:
+                        logger.warning(f"BeamStudio API REFUSED to answer: {refusal}")
+                        # Return a helpful message about the refusal
+                        output = f"The model declined to answer: {refusal}"
+                    elif 'content' in msg:
+                        output = msg['content']
+                        if not output:
+                            # Check content_filter_results for why it might be empty
+                            filter_results = choice.get('content_filter_results', {})
+                            if filter_results:
+                                logger.warning(f"BeamStudio content filter results: {filter_results}")
+                            logger.warning("BeamStudio API returned empty content string (no refusal message)")
+                            # Try to provide a fallback response
+                            output = ""
+                    else:
+                        output = str(choice)
+                        logger.warning(f"BeamStudio response missing content in message: {msg}")
                 else:
                     output = str(choice)
+                    logger.warning(f"BeamStudio response missing message structure: {choice}")
             else:
                 output = str(data)
+                logger.warning(f"BeamStudio response missing choices: {data}")
+            
+            # Extract and store token usage
+            latency_ms = (datetime.now() - start_time).total_seconds() * 1000
+            self.last_usage = None
+            if 'usage' in data:
+                usage = data['usage']
+                self.last_usage = {
+                    'prompt_tokens': usage.get('prompt_tokens', 0),
+                    'completion_tokens': usage.get('completion_tokens', 0),
+                    'total_tokens': usage.get('total_tokens', 0),
+                    'reasoning_tokens': usage.get('completion_tokens_details', {}).get('reasoning_tokens', 0) if 'completion_tokens_details' in usage else 0,
+                    'latency_ms': latency_ms,
+                    'finish_reason': data['choices'][0].get('finish_reason', 'unknown') if data.get('choices') else 'unknown'
+                }
+                # Clear, visible logging of token usage
+                logger.info(f"[TOKEN_USAGE] prompt={self.last_usage['prompt_tokens']}, completion={self.last_usage['completion_tokens']}, "
+                           f"reasoning={self.last_usage['reasoning_tokens']}, total={self.last_usage['total_tokens']}, "
+                           f"finish_reason={self.last_usage['finish_reason']}, latency={latency_ms:.0f}ms")
             
             # Add span attributes for observability
             if span:
                 try:
-                    latency_ms = (datetime.now() - start_time).total_seconds() * 1000
                     set_span_attribute(span, "llm.completion_length", len(output))
                     set_span_attribute(span, "llm.latency_ms", latency_ms)
                     set_span_attribute(span, "http.status_code", response.status_code)
                     
                     # Token usage if available
-                    if 'usage' in data:
-                        usage = data['usage']
-                        set_span_attribute(span, "llm.tokens.prompt", usage.get('prompt_tokens', 0))
-                        set_span_attribute(span, "llm.tokens.completion", usage.get('completion_tokens', 0))
-                        set_span_attribute(span, "llm.tokens.total", usage.get('total_tokens', 0))
+                    if self.last_usage:
+                        set_span_attribute(span, "llm.tokens.prompt", self.last_usage['prompt_tokens'])
+                        set_span_attribute(span, "llm.tokens.completion", self.last_usage['completion_tokens'])
+                        set_span_attribute(span, "llm.tokens.total", self.last_usage['total_tokens'])
+                        set_span_attribute(span, "llm.tokens.reasoning", self.last_usage['reasoning_tokens'])
                 except Exception:
                     pass
             
@@ -490,8 +575,8 @@ def get_llm_client(
 
 # Convenience function to list available BeamStudio models
 def get_beamstudio_models() -> List[str]:
-    """Return list of available BeamStudio models."""
-    return ["gpt-4o", "gpt-5-mini", "gpt-5.1"]
+    """Return list of available BeamStudio models (gpt-5.1 first as default)."""
+    return ["gpt-5.1", "gpt-4o", "gpt-5-mini"]
 
 
 def is_beamstudio_configured() -> bool:

@@ -1,0 +1,31 @@
+# Logs (observability via Langfuse/OpenTelemetry instead)
+*.log
+logs/
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.Python
+*.so
+.venv/
+venv/
+env/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Env and secrets
+.env
+.env.local
+*.pem
+
+# SSL certificates
+.ssl/
+
+# Generated RAG index and model weights
+safe_index/
+model_w/

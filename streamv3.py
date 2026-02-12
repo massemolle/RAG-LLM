@@ -25,8 +25,10 @@ from RagV2 import (
     get_llm_client, get_beamstudio_models, is_beamstudio_configured
 )
 from llm_client import LLMClient, LocalLLMClient, BeamStudioClient
-from ingest_safe import run_ingest
-from defense.safe_retrieval import SafeIndex
+from rag_defense.ingest import run_ingest
+from rag_defense.safe_retrieval import SafeIndex
+from rag_defense.classification import DataClassification
+from rag_defense.index_versioning import list_versions, rollback_index
 
 # Initialize OpenTelemetry with Langfuse exporter
 try:
@@ -73,29 +75,63 @@ st.title("LLM + Secure RAG — Demo (Enovos/Encevo)")
 with open("policy.yaml", "r", encoding="utf-8") as f:
     policy = yaml.safe_load(f)
 
+# Initialize session state for checkboxes (only once)
+if "cite_or_silent" not in st.session_state:
+    st.session_state.cite_or_silent = policy.get("output", {}).get("cite_or_silent", True)
+if "safe_mode" not in st.session_state:
+    st.session_state.safe_mode = policy.get("safe_mode", True)
+if "guardrails_mode" not in st.session_state:
+    st.session_state.guardrails_mode = policy.get("guardrails_mode", "complete")
+if "policy_mode" not in st.session_state:
+    st.session_state.policy_mode = policy.get("mode", "monitor")
+
 c1, c2, c3, c4 = st.columns(4)
 with c1:
     mode = st.selectbox("Policy mode", ["off","monitor","strict"],
-                        index=["off","monitor","strict"].index(policy.get("mode","monitor")))
+                        index=["off","monitor","strict"].index(st.session_state.policy_mode),
+                        key="policy_mode_select")
+    st.session_state.policy_mode = mode
 with c2:
-    safe_mode = st.checkbox("Safe mode (no tools; retrieval only)", value=policy.get("safe_mode", True))
+    safe_mode = st.checkbox("Safe mode (no tools; retrieval only)", 
+                            value=st.session_state.safe_mode,
+                            key="safe_mode_checkbox")
+    st.session_state.safe_mode = safe_mode
 with c3:
     # Cite-or-silent: ON = only answer from docs, OFF = always answer
     cite_or_silent = st.checkbox(
         "Cite-or-silent", 
-        value=policy.get("output",{}).get("cite_or_silent", True),
+        value=st.session_state.cite_or_silent,
+        key="cite_or_silent_checkbox",
         help="ON: Only answer if info found in documents. OFF: Always answer using LLM."
     )
+    st.session_state.cite_or_silent = cite_or_silent
     # Update in-memory policy immediately when checkbox changes
     from defense.guards import update_cite_or_silent
     update_cite_or_silent(cite_or_silent)
 with c4:
-    use_guardrails = st.checkbox("🛡️ Enable Guardrails", value=True, help="NVIDIA NeMo Guardrails protection")
+    GUARDRAILS_OPTIONS = [
+        ("Off (no guardrails)", "off"),
+        ("Classic (LLM judge only)", "classic"),
+        ("Complete (full pipeline)", "complete"),
+    ]
+    labels = [x[0] for x in GUARDRAILS_OPTIONS]
+    values = [x[1] for x in GUARDRAILS_OPTIONS]
+    current_mode = st.session_state.guardrails_mode
+    idx = values.index(current_mode) if current_mode in values else 2  # default Complete
+    guardrails_mode_label = st.selectbox(
+        "Guardrails",
+        labels,
+        index=idx,
+        key="guardrails_mode_select",
+        help="Off: classic API only. Classic: LLM judge for input and output. Complete: full pipeline."
+    )
+    st.session_state.guardrails_mode = values[labels.index(guardrails_mode_label)]
 
 if st.button("Save policy"):
     policy["mode"] = mode
     policy["safe_mode"] = safe_mode
     policy.setdefault("output", {})["cite_or_silent"] = cite_or_silent
+    policy["guardrails_mode"] = st.session_state.guardrails_mode
     with open("policy.yaml","w",encoding="utf-8") as f:
         yaml.safe_dump(policy, f)
     # Reload the in-memory POLICY so changes take effect immediately
@@ -119,22 +155,36 @@ method = 'BM25' if mode_sel == 'User BM25' else st.selectbox('RAG methods', ['De
 if 'rag_model' not in st.session_state or st.session_state.get('name') != method:
     st.session_state.rag_model = _get_rag(method, selected_device)
     st.session_state.name = method
-    # Initialize enhanced structured guardrails if available
-    if GUARDRAILS_AVAILABLE and use_guardrails:
+
+# Dynamic guardrails init: create or clear based on guardrails_mode (runs every rerun)
+guardrails_mode = st.session_state.guardrails_mode
+if guardrails_mode == "off":
+    st.session_state.guardrails = None
+    if hasattr(st.session_state, 'guardrails_mode_initialized'):
+        del st.session_state.guardrails_mode_initialized
+elif guardrails_mode in ("classic", "complete") and st.session_state.get("rag_model") and GUARDRAILS_AVAILABLE:
+    need_init = (
+        st.session_state.get("guardrails") is None
+        or getattr(st.session_state.get("guardrails"), "guardrails_mode", None) != guardrails_mode
+    )
+    if need_init:
         try:
             nemo_config_path = os.path.join("nvidia_nemo", "config")
             policy_matrix_path = os.path.join("nvidia_nemo", "policy_matrix.yml")
             st.session_state.guardrails = EnhancedStructuredGuardrails(
                 st.session_state.rag_model,
-                allowed_domains=["RAG", "embeddings", "retrieval", "documents", 
-                               "machine learning", "AI", "natural language processing"],
+                allowed_domains=["RAG", "embeddings", "retrieval", "documents",
+                                 "machine learning", "AI", "natural language processing"],
                 nemo_config_path=nemo_config_path if os.path.exists(nemo_config_path) else None,
-                policy_matrix_path=policy_matrix_path if os.path.exists(policy_matrix_path) else None
+                policy_matrix_path=policy_matrix_path if os.path.exists(policy_matrix_path) else None,
+                mode=guardrails_mode
             )
+            st.session_state.guardrails_mode_initialized = guardrails_mode
         except Exception as e:
             st.warning(f"Could not initialize guardrails: {e}")
             st.session_state.guardrails = None
-    else:
+else:
+    if guardrails_mode in ("classic", "complete") and not st.session_state.get("rag_model"):
         st.session_state.guardrails = None
 
 # --- LLM selection ---
@@ -150,7 +200,8 @@ if beamstudio_configured:
 else:
     st.info("ℹ️ BeamStudio API not configured - set BEAMSTUDIO_API_KEY in .env for cloud models")
 
-llm_name = st.selectbox("Select LLM (or 'Other')", all_models)
+# Default to BeamStudio gpt-5.1 (index 1: first option is "Please select LLM model")
+llm_name = st.selectbox("Select LLM (or 'Other')", all_models, index=1)
 
 if llm_name != 'Please select LLM model':
     # Check if selection changed
@@ -169,6 +220,18 @@ if llm_name != 'Please select LLM model':
                         # Update RAG model with new LLM client
                         st.session_state.rag_model.llm_client = llm_client
                         st.session_state.rag_model.pipe = None  # No local pipeline for API
+                        
+                        # Adjust token limits based on model type
+                        if 'gpt-5.1' in model or 'o1' in model or 'o3' in model:
+                            st.session_state.rag_model.gen_args["max_new_tokens"] = 4000
+                            st.info(f"ℹ️ {model} is a reasoning model – 4000 max tokens")
+                        elif 'gpt-4o' in model:
+                            st.session_state.rag_model.gen_args["max_new_tokens"] = 2000
+                            st.info(f"ℹ️ {model} – 2000 max tokens")
+                        else:
+                            st.session_state.rag_model.gen_args["max_new_tokens"] = 3000
+                            st.info(f"ℹ️ {model} – 3000 max tokens")
+                        
                         st.session_state.current_llm_name = llm_name
                         st.session_state.llm = True
                         st.success(f"✅ Connected to BeamStudio: {model}")
@@ -213,20 +276,112 @@ st.subheader("1) Approved documents")
 path_to_dir = st.text_input('Folder with raw docs (.pdf, .docx, .txt)', './database')
 collection = st.text_input('Collection name', 'grid_ops')
 
-c_ing1, c_ing2 = st.columns([1,1])
+# Data classification selector
+classification_options = ["auto (folder-based)"] + [dc.value for dc in DataClassification]
+selected_class = st.selectbox(
+    "Data classification",
+    classification_options,
+    index=0,
+    help="public / entity_internal / group_internal are allowed. classified / secret are REJECTED."
+)
+_explicit_class = None if selected_class.startswith("auto") else selected_class
+
+c_ing1, c_ing2 = st.columns([1, 1])
 with c_ing1:
     if st.button("Run Safe Ingest"):
-        res = run_ingest(src=path_to_dir, collection=collection)
-        safe_idx.reload()  # refresh in-memory index
-        st.success(f"Ingested {res['files']} files → {res['chunks']} chunks into ./safe_index")
+        with st.spinner("Scanning and ingesting documents..."):
+            res = run_ingest(
+                src=path_to_dir,
+                collection=collection,
+                classification_level=_explicit_class,
+            )
+            safe_idx.reload()
+        # Store results in session state so they survive reruns
+        st.session_state["last_ingest_result"] = res
+        st.success(
+            f"Ingested **{res['files']}** files, **{res['chunks']}** chunks. "
+            f"Rejected: {res['rejected']}, Quarantined: {res['quarantined']}."
+        )
+
+# Show scan details from last ingest (persists across reruns)
+_last_ingest = st.session_state.get("last_ingest_result")
+if _last_ingest and _last_ingest.get("scan_summary"):
+    _summary = _last_ingest["scan_summary"]
+    # Counters for the header
+    _n_ok = sum(1 for s in _summary if s.get("status") == "ingested")
+    _n_quar = sum(1 for s in _summary if s.get("status") == "quarantined")
+    _n_rej = sum(1 for s in _summary if s.get("status") == "rejected")
+    _header = f"Scan results: {_n_ok} ingested, {_n_quar} quarantined, {_n_rej} rejected"
+    with st.expander(_header, expanded=False):
+        for info in _summary:
+            status = info.get("status", "?")
+            fname = info.get("file", "?")
+            cls = info.get("classification", "?")
+            flags_detail = info.get("flags_detail", [])
+
+            if status == "rejected":
+                st.warning(f"**{fname}** [{cls}] — REJECTED: {info.get('reason', '')}")
+            elif status == "quarantined":
+                st.error(
+                    f"**{fname}** [{cls}] — QUARANTINED "
+                    f"({info.get('scan_blocks', 0)} block, "
+                    f"{info.get('scan_warns', 0)} warn, "
+                    f"{info.get('scan_info', 0)} info)"
+                )
+            elif status == "ingested":
+                warns = info.get("scan_warns", 0)
+                suffix = f" ({warns} warnings)" if warns else ""
+                st.success(f"**{fname}** [{cls}] — ingested, {info.get('chunks', 0)} chunks{suffix}")
+            elif status == "skipped_empty":
+                st.caption(f"**{fname}** — skipped (empty)")
+
+            # Show detailed flags if any
+            if flags_detail:
+                for fl in flags_detail:
+                    sev = fl.get("severity", "?")
+                    cat = fl.get("category", "?")
+                    desc = fl.get("description", "?")
+                    matched = fl.get("matched_text", "")
+                    pname = fl.get("pattern_name", "")
+                    if sev == "block":
+                        st.markdown(f"&nbsp;&nbsp;&nbsp;&nbsp;:red[**BLOCK**] `{cat}` / `{pname}` — {desc}")
+                    elif sev == "warn":
+                        st.markdown(f"&nbsp;&nbsp;&nbsp;&nbsp;:orange[**WARN**] `{cat}` / `{pname}` — {desc}")
+                    else:
+                        st.markdown(f"&nbsp;&nbsp;&nbsp;&nbsp;:blue[**INFO**] `{cat}` / `{pname}` — {desc}")
+                    if matched:
+                        st.code(matched, language=None)
+
+        # Overall stats
+        total_flags = sum(len(s.get("flags_detail", [])) for s in _summary)
+        if total_flags:
+            st.divider()
+            st.caption(f"Total flags across all files: **{total_flags}**")
 
 with c_ing2:
     man = "./safe_index/manifest.json"
     if os.path.exists(man):
-        st.download_button("Download manifest.json", open(man,"rb"), file_name="manifest.json")
+        st.download_button("Download manifest.json", open(man, "rb"), file_name="manifest.json")
 
 _idx = SafeIndex()
-st.info(f"Safe index status: {len(_idx.records)} chunks indexed.")
+st.info(f"Safe index: **{len(_idx.records)}** chunks indexed.")
+
+# Index versioning
+_versions = list_versions()
+if _versions:
+    with st.expander(f"Index versions ({len(_versions)} snapshots)", expanded=False):
+        for v in _versions:
+            label = v.get("label", "?")
+            chunks = v.get("chunks", "?")
+            created = v.get("created", "?")
+            st.caption(f"**{label}** — {chunks} chunks — {created}")
+        rb_label = st.selectbox("Rollback to version", [v.get("label", "") for v in _versions], key="rb_version")
+        if st.button("Rollback"):
+            if rollback_index(rb_label):
+                safe_idx.reload()
+                st.success(f"Rolled back to version {rb_label}. Index reloaded.")
+            else:
+                st.error(f"Rollback failed for version {rb_label}.")
 
 # Optional: legacy retriever population (keeps your previous flow)
 if st.button("Process with legacy retriever (optional)"):
@@ -264,8 +419,8 @@ if prompt:
     st.session_state.messages.append({"role":"user","content":prompt})
 
     with st.chat_message("assistant"):
-        # Use structured guardrails if enabled
-        if use_guardrails and GUARDRAILS_AVAILABLE and st.session_state.get('guardrails'):
+        # Use structured guardrails if enabled (classic or complete mode)
+        if guardrails_mode != "off" and GUARDRAILS_AVAILABLE and st.session_state.get('guardrails'):
             # Generate user ID (could be from authentication)
             user_id = f"user_{st.session_state.session_id[:8]}"
             
@@ -323,21 +478,28 @@ if prompt:
                     
                     layers = timing_info.get('layers', {})
                     if layers:
-                        # --- High-level row: Input Guards | LLM Generation | LLM Judge | Output Guards ---
-                        input_guards_key = next((k for k in layers if 'parallel_input' in k or 'input_guards' in k.lower()), None)
-                        output_guards_key = next((k for k in layers if 'parallel_output' in k or 'output_guards' in k.lower()), None)
+                        # --- Resolve layer keys ---
+                        input_guards_key = next((k for k in layers if 'parallel_input' in k or 'input_guards' in k.lower() or k == 'input_llm_judge'), None)
+                        output_guards_key = next((k for k in layers if 'parallel_output' in k or 'output_guards' in k.lower() or k == 'output_llm_judge'), None)
+                        if not input_guards_key:
+                            input_guards_key = next((k for k in layers if 'input_classic' in k), None)
+                        if not output_guards_key:
+                            output_guards_key = next((k for k in layers if 'output_classic' in k), None)
                         llm_judge_key = next((k for k in layers if 'llm_judge' in k.lower()), None)
                         llm_gen_key = next((k for k in layers if 'llm_generation' in k.lower()), None)
+                        is_classic = (st.session_state.get("guardrails_mode") == "classic") or (input_guards_key and "classic" in input_guards_key)
                         
+                        # --- High-level row: Classic = 3 cols (Input, LLM, Output); Complete = 4 with LLM Judge ---
                         display_layers = []
                         if input_guards_key:
                             display_layers.append((input_guards_key, layers[input_guards_key]))
                         if llm_gen_key:
                             display_layers.append((llm_gen_key, layers[llm_gen_key]))
-                        if llm_judge_key:
-                            display_layers.append((llm_judge_key, layers[llm_judge_key]))
-                        else:
-                            display_layers.append(("layer_3_llm_judge", {"duration_ms": 0, "result": "SKIPPED", "skipped": True, "details": {}}))
+                        if not is_classic:
+                            if llm_judge_key:
+                                display_layers.append((llm_judge_key, layers[llm_judge_key]))
+                            else:
+                                display_layers.append(("layer_3_llm_judge", {"duration_ms": 0, "result": "SKIPPED", "skipped": True, "details": {}}))
                         if output_guards_key:
                             display_layers.append((output_guards_key, layers[output_guards_key]))
                         
@@ -359,8 +521,27 @@ if prompt:
                                 else:
                                     st.metric(display_name, f"{duration:.0f}ms", "OK")
                         
-                        # --- Deep dive: per-guard timings (always visible) ---
+                        # --- Deep dive: per-guard timings ---
                         st.markdown("**📊 Per-guard breakdown**")
+                        if is_classic:
+                            guard_labels_input = {"input-sentimental": "Input sentimental", "input-security": "Input security", "input-topic": "Input topic"}
+                            guard_labels_output = {"output-topic": "Output topic", "output-global": "Output global"}
+                        else:
+                            guard_labels_input = {
+                                "embedding-similarity": "Embedding similarity",
+                                "llm-guard": "LLM Guard",
+                                "topic-taxonomy": "Topic taxonomy",
+                                "input-security": "NeMo (input guardrails 2 layers)",
+                                "input-sentimental": "Input sentimental",
+                                "input-topic": "Input topic",
+                            }
+                            guard_labels_output = {
+                                "output-differential": "Output differential",
+                                "output-topic": "Output topic",
+                                "output-integrity": "Output integrity",
+                                "output-ip": "Output IP",
+                                "output-global": "Output global",
+                            }
                         
                         # Input guards deep dive
                         if input_guards_key:
@@ -368,21 +549,11 @@ if prompt:
                             details = input_data.get('details', {})
                             individual = details.get('individual_timings', {})
                             if individual:
-                                # Sort by time descending to show bottleneck first
                                 sorted_guards = sorted(individual.items(), key=lambda x: -x[1])
                                 max_time = max(individual.values()) if individual else 0
-                                # Human-readable guard names
-                                guard_labels = {
-                                    "embedding-similarity": "Embedding similarity",
-                                    "llm-guard": "LLM Guard",
-                                    "topic-taxonomy": "Topic taxonomy",
-                                    "input-security": "NeMo (input guardrails 2 layers)",
-                                    "input-sentimental": "Input sentimental",
-                                    "input-topic": "Input topic",
-                                }
                                 bottleneck_shown = False
                                 for guard_name, guard_time in sorted_guards:
-                                    label = guard_labels.get(guard_name, guard_name.replace("-", " ").title())
+                                    label = guard_labels_input.get(guard_name, guard_name.replace("-", " ").title())
                                     is_bottleneck = not bottleneck_shown and guard_time >= max_time and max_time > 0
                                     if is_bottleneck:
                                         bottleneck_shown = True
@@ -391,9 +562,39 @@ if prompt:
                             else:
                                 st.caption(f"• _Input guards total: {input_data.get('duration_ms', 0):.0f}ms (no per-guard breakdown)_")
                         
-                        # LLM Judge: show abortion/skip reason when skipped
-                        if not llm_judge_key:
+                        if not is_classic and not llm_judge_key:
                             st.caption("• **LLM Judge**: skipped — no guard requested escalation → not invoked (saves ~1–2s)")
+                        
+                        # Token usage from LLM (if available)
+                        if hasattr(st.session_state, 'rag_model') and hasattr(st.session_state.rag_model, 'llm_client'):
+                            client = st.session_state.rag_model.llm_client
+                            if hasattr(client, 'last_usage') and client.last_usage:
+                                usage = client.last_usage
+                                st.markdown("**🔢 LLM Token Usage**")
+                                token_cols = st.columns(4)
+                                with token_cols[0]:
+                                    st.metric("Prompt", f"{usage.get('prompt_tokens', 0):,}")
+                                with token_cols[1]:
+                                    st.metric("Completion", f"{usage.get('completion_tokens', 0):,}")
+                                with token_cols[2]:
+                                    reasoning = usage.get('reasoning_tokens', 0)
+                                    st.metric("Reasoning", f"{reasoning:,}" if reasoning else "N/A")
+                                with token_cols[3]:
+                                    st.metric("Total", f"{usage.get('total_tokens', 0):,}")
+                                
+                                # Efficiency indicator
+                                completion = usage.get('completion_tokens', 0)
+                                reasoning = usage.get('reasoning_tokens', 0)
+                                if completion > 0 and reasoning > 0:
+                                    output_tokens = completion - reasoning
+                                    efficiency = (output_tokens / completion * 100) if completion > 0 else 0
+                                    st.caption(f"📈 Output efficiency: {efficiency:.0f}% ({output_tokens} output tokens / {completion} completion tokens)")
+                                
+                                finish = usage.get('finish_reason', 'unknown')
+                                if finish == 'length':
+                                    st.warning(f"⚠️ Finish reason: `{finish}` — response may have been truncated")
+                                else:
+                                    st.caption(f"Finish reason: `{finish}`")
                         
                         # Output guards deep dive
                         if output_guards_key:
@@ -402,32 +603,34 @@ if prompt:
                             individual = details.get('individual_timings', {})
                             if individual:
                                 sorted_guards = sorted(individual.items(), key=lambda x: -x[1])
-                                out_labels = {
-                                    "output-differential": "Output differential",
-                                    "output-topic": "Output topic",
-                                    "output-integrity": "Output integrity",
-                                    "output-ip": "Output IP",
-                                    "output-global": "Output global",
-                                }
                                 for guard_name, guard_time in sorted_guards:
-                                    label = out_labels.get(guard_name, guard_name.replace("-", " ").title())
+                                    label = guard_labels_output.get(guard_name, guard_name.replace("-", " ").title())
                                     st.caption(f"• **{label}**: {guard_time:.0f}ms")
                             else:
                                 st.caption(f"• _Output guards total: {out_data.get('duration_ms', 0):.0f}ms_")
                     
                     st.divider()
                 
-                # Layer architecture visual
+                # Layer architecture visual (classic vs complete)
                 st.subheader("🔄 Defense Pipeline (Speculative Parallel)")
-                st.markdown("""
-                ```
-                Line A:  Query ─► PARALLEL input guards ─► [LLM Judge*] ─► input_ok?
+                if st.session_state.get("guardrails_mode") == "classic":
+                    st.markdown("""
+                    ```
+                    Line A:  Query ─► PARALLEL 3 input LLM judges (sentimental, security, topic) ─► input_ok?
+                    Line B:  Query ─► LLM (RAG or direct) ─► PARALLEL 2 output LLM judges (topic, global) ─► response_ok?
+                    Display answer only if input_ok and response_ok (both lines run in parallel)
+                    ```
+                    """)
+                else:
+                    st.markdown("""
+                    ```
+                    Line A:  Query ─► PARALLEL input guards ─► [LLM Judge*] ─► input_ok?
                                     ┌─ Embedding, LLM Guard, NeMo, Topic, Sentimental, Input Topic
                                     └─ *only if escalated
-                Line B:  Query ─► LLM (RAG or direct) ─► PARALLEL output guards ─► response_ok?
-                Display answer only if input_ok and response_ok (both lines run in parallel)
-                ```
-                """)
+                    Line B:  Query ─► LLM (RAG or direct) ─► PARALLEL output guards ─► response_ok?
+                    Display answer only if input_ok and response_ok (both lines run in parallel)
+                    ```
+                    """)
                 
                 st.divider()
                 
@@ -494,19 +697,42 @@ if prompt:
                 with st.expander("📜 Detailed Guard Logs"):
                     for log_line in log_lines:
                         st.code(log_line, language=None)
+            
+            # Show response time prominently (outside expander)
+            if timing_info:
+                _total_ms = timing_info.get('total_ms', 0)
+                st.caption(f"⏱️ **Response time:** {_total_ms:.0f} ms")
         else:
-            # Fallback to direct RAG (with tracing)
+            # Guardrails off: direct RAG, still show time and token usage
             user_id = f"user_{st.session_state.session_id[:8]}"
+            import time as _time
+            _t0 = _time.perf_counter()
             answ = st.session_state.rag_model.answer(
                 prompt,
                 role="analyst",
                 user_id=user_id,
                 session_id=st.session_state.session_id
             )
+            _elapsed_ms = (_time.perf_counter() - _t0) * 1000
+            # Show response time prominently
+            st.caption(f"⏱️ **Response time:** {_elapsed_ms:.0f} ms")
+            with st.expander("Token usage details", expanded=False):
+                if hasattr(st.session_state.rag_model, "llm_client") and getattr(st.session_state.rag_model.llm_client, "last_usage", None):
+                    usage = st.session_state.rag_model.llm_client.last_usage
+                    c1, c2, c3, c4 = st.columns(4)
+                    with c1:
+                        st.metric("Prompt tokens", f"{usage.get('prompt_tokens', 0):,}")
+                    with c2:
+                        st.metric("Completion tokens", f"{usage.get('completion_tokens', 0):,}")
+                    with c3:
+                        r = usage.get("reasoning_tokens", 0)
+                        st.metric("Reasoning tokens", f"{r:,}" if r else "N/A")
+                    with c4:
+                        st.metric("Total tokens", f"{usage.get('total_tokens', 0):,}")
+                else:
+                    st.caption("Token usage not available (e.g. local model).")
         
         st.markdown(answ)
     st.session_state.messages.append({"role":"assistant","content":answ})
 
 st.caption("Transparency: Answers cite approved sources when used. If no relevant source exists, the assistant may answer generally (policy-controlled).")
-if use_guardrails and GUARDRAILS_AVAILABLE:
-    st.info("🛡️ **Guardrails Active**: Input validation, jailbreak detection, PII redaction, and citation enforcement are enabled.")

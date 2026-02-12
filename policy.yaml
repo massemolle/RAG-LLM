@@ -23,7 +23,7 @@ mode: monitor
 output:
   allow_general_if_no_docs: true
   auto_cite_if_missing: true
-  cite_or_silent: true
+  cite_or_silent: false
 provider:
   azure_deployment: ''
   llm: local

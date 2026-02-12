@@ -74,9 +74,12 @@ class RAG():
                 pipeline_instance=self.pipe
             )
 
-        # sensible defaults for tiny models (helps avoid loops/nonsense)
+        # Generation arguments
+        # Note: max_new_tokens must be high enough for reasoning models (gpt-5.1, o1, etc.)
+        # which use tokens for internal chain-of-thought before producing output
+        # Complex queries can use 1000+ reasoning tokens before any output
         self.gen_args = {
-            "max_new_tokens": 220,
+            "max_new_tokens": 4000,  # Very high for complex reasoning queries
             "temperature": 0.2,
             "top_p": 0.9,
             "repetition_penalty": 1.25,
@@ -137,6 +140,13 @@ class RAG():
             context_list = [t["text"] for t in top]
             metas = [t["meta"] for t in top]
             
+            # Record retrieval for anomaly monitoring
+            try:
+                from rag_defense.retrieval_monitor import get_retrieval_monitor
+                get_retrieval_monitor().record(top)
+            except Exception:
+                pass
+
             # Log retrieval to Langfuse
             if retrieval_span_langfuse:
                 try:
@@ -192,6 +202,16 @@ class RAG():
             return "Blocked: suspected prompt-injection. Please rephrase."
 
         has_docs = bool(safe_chunks)
+        
+        # Cross-chunk consistency check (warn only, never block)
+        consistency_warnings = []
+        if has_docs and len(safe_chunks) >= 2:
+            try:
+                from rag_defense.consistency import flag_inconsistencies
+                consistency_warnings = flag_inconsistencies(safe_chunks, query)
+            except Exception:
+                pass
+
         cite_or_silent_early = POLICY.get("output", {}).get("cite_or_silent", True)
 
         # CITE-OR-SILENT early exit: If ON and no docs found, refuse immediately
@@ -302,6 +322,13 @@ class RAG():
                 "- Supersonic jets vary widely (Mach >1)\n"
                 "Exact speed depends on aircraft type, altitude and wind."
             )
+
+        # Append consistency warnings if any (informational, never block)
+        if consistency_warnings:
+            warn_lines = "\n".join(
+                f"- {w.description}" for w in consistency_warnings[:3]
+            )
+            out += f"\n\n> **Note:** Potential inconsistencies detected between sources:\n{warn_lines}"
 
         return out
 
