@@ -22,10 +22,12 @@ env/
 .env
 .env.local
 *.pem
+.streamlit/credentials.toml
 
 # SSL certificates
 .ssl/
 
 # Generated RAG index and model weights
 safe_index/
+rag/index/
 model_w/

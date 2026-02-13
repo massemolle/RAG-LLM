@@ -1,4 +1,14 @@
-# RagV2.py
+"""
+RAG Orchestrator (v2)
+=====================
+
+Core Retrieval-Augmented Generation logic. Manages the LLM pipeline,
+retrieval from the safe index, policy gating, and response generation.
+
+The ``RAG`` class is the main entry point, instantiated once and shared
+across the Streamlit session.
+"""
+
 import os, re, torch
 from datetime import datetime
 from typing import Optional, Union
@@ -6,8 +16,8 @@ from transformers import pipeline
 from huggingface_hub import repo_exists
 
 from embedding import *  # your BM25/BERT classes
-from defense.guards import POLICY, gate_and_log, path_is_allowed, redact
-from defense.safe_retrieval import SafeIndex
+from defense.guards import POLICY, filter_chunks, redact
+from rag.safe_retrieval import SafeIndex
 
 # Import LLM client abstraction
 from llm_client import (
@@ -28,12 +38,17 @@ __all__ = [
 ]
 
 def _clean_answer(text: str) -> str:
-    # remove template debris the tiny model sometimes emits
-    text = re.sub(r"<\|[^>]{1,40}\|>", "", text)       # <|im_end|>, etc.
-    text = re.sub(r"(?im)^\s*(question|answer)\s*:\s*", "", text)
-    text = re.sub(r"\b(\w+)(\s+\1){1,}\b", r"\1", text)  # de-stutter
-    text = re.sub(r"[ \t]+", " ", text)
-    return text.strip()
+    """Clean raw LLM output — delegates to shared utils.text."""
+    try:
+        from utils.text import sanitize_llm_output
+        return sanitize_llm_output(text)
+    except ImportError:
+        # Inline fallback
+        text = re.sub(r"<\|[^>]{1,40}\|>", "", text)
+        text = re.sub(r"(?im)^\s*(question|answer)\s*:\s*", "", text)
+        text = re.sub(r"\b(\w+)(\s+\1){1,}\b", r"\1", text)
+        text = re.sub(r"[ \t]+", " ", text)
+        return text.strip()
 
 def _offtopic_constants(question: str, answer: str) -> bool:
     q = question.lower()
@@ -53,7 +68,7 @@ class RAG():
                  device="cpu",
                  llm_client: Optional[LLMClient] = None):
         self.k = k
-        self.path = path or "./database"
+        self.path = path or "./rag/data"
         self.pipe_model = pipeline_model
         
         # Use provided LLM client or create a local one
@@ -142,7 +157,7 @@ class RAG():
             
             # Record retrieval for anomaly monitoring
             try:
-                from rag_defense.retrieval_monitor import get_retrieval_monitor
+                from rag.retrieval_monitor import get_retrieval_monitor
                 get_retrieval_monitor().record(top)
             except Exception:
                 pass
@@ -165,41 +180,10 @@ class RAG():
                     )
                 except Exception:
                     pass
-        else:
-            retrieval_ok = (self.model is not None and self.path and path_is_allowed(self.path))
-            if retrieval_ok:
-                try:
-                    ret = self.model.retrieve(query, path=self.path, doc=doc)
-                    context_list = ret.get('doc') or ret.get('documents') or []
-                    scores = ret.get('score', [0.0] * len(context_list))
-                    metas = [{"doc":"(legacy)", "chunk":i, "collection":"legacy"}
-                             for i,_ in enumerate(context_list)]
-                    
-                    # Log retrieval to Langfuse
-                    if retrieval_span_langfuse:
-                        try:
-                            from observability.langfuse_integration import log_retrieval
-                            log_retrieval(
-                                retrieval_span_langfuse,
-                                name="legacy_retrieval",
-                                query=query,
-                                documents=context_list,
-                                scores=scores,
-                                metadata={
-                                    "retrieval_method": "legacy",
-                                    "method_type": str(type(self.model).__name__)
-                                }
-                            )
-                        except Exception:
-                            pass
-                except Exception as e:
-                    print(f"[RAG] Retrieval failed: {e}")
-                    context_list = []
-
-        # 2) Policy gate (prompt-injection, quarantine)
-        blocked, safe_chunks = gate_and_log(query, context_list, role=role)
-        if blocked and POLICY["mode"] == "strict":
-            return "Blocked: suspected prompt-injection. Please rephrase."
+        # 2) Filter retrieved chunks (remove any that look like injections)
+        safe_chunks, quarantined, _hashes = filter_chunks(context_list)
+        if quarantined:
+            print(f"[RAG] Quarantined {quarantined} chunk(s) with suspected injection")
 
         has_docs = bool(safe_chunks)
         
@@ -207,7 +191,7 @@ class RAG():
         consistency_warnings = []
         if has_docs and len(safe_chunks) >= 2:
             try:
-                from rag_defense.consistency import flag_inconsistencies
+                from rag.consistency import flag_inconsistencies
                 consistency_warnings = flag_inconsistencies(safe_chunks, query)
             except Exception:
                 pass
@@ -332,6 +316,19 @@ class RAG():
 
         return out
 
+# --- System prompt constants (importable for leakage detection) ---
+SYSTEM_PROMPT_RAG = (
+    "You are a helpful assistant that answers questions based on provided documents. "
+    "IMPORTANT: You MUST cite your sources using [#i doc#chunk] format. "
+    "If the documents do not contain relevant information, say so clearly."
+)
+SYSTEM_PROMPT_GENERAL = "You are a helpful assistant. Answer briefly and factually."
+SYSTEM_PROMPT_STRICT = "You can only answer from approved sources."
+
+# Collected for leakage detection by output guards
+SYSTEM_PROMPTS = [SYSTEM_PROMPT_RAG, SYSTEM_PROMPT_GENERAL, SYSTEM_PROMPT_STRICT]
+
+
 def build_prompt(query, chunks, metas):
     """Build a prompt for the LLM. Returns list of chat messages."""
     if chunks:
@@ -342,30 +339,22 @@ def build_prompt(query, chunks, metas):
             tag = f"[#{i} {meta.get('doc','?')}#{meta.get('chunk','?')}]"
             numbered.append(f"{tag}\n{str(txt)}")
         docs = "\n\n".join(numbered)
-        
-        # System message with instructions
-        system_msg = (
-            "You are a helpful assistant that answers questions based on provided documents. "
-            "IMPORTANT: You MUST cite your sources using [#i doc#chunk] format. "
-            "If the documents do not contain relevant information, say so clearly."
-        )
-        
-        # User message with documents and question
+
         user_msg = f"Documents:\n\n{docs}\n\nQuestion: {query}"
-        
+
         return [
-            {"role": "system", "content": system_msg},
+            {"role": "system", "content": SYSTEM_PROMPT_RAG},
             {"role": "user", "content": user_msg}
         ]
     else:
         # No documents available
         if POLICY.get("output", {}).get("allow_general_if_no_docs", True):
             return [
-                {"role": "system", "content": "You are a helpful assistant. Answer briefly and factually."},
+                {"role": "system", "content": SYSTEM_PROMPT_GENERAL},
                 {"role": "user", "content": query}
             ]
         return [
-            {"role": "system", "content": "You can only answer from approved sources."},
+            {"role": "system", "content": SYSTEM_PROMPT_STRICT},
             {"role": "user", "content": "I cannot answer this question as no approved sources are available."}
         ]
 

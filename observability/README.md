@@ -2,6 +2,8 @@
 
 Production-ready OpenTelemetry integration with Langfuse for comprehensive tracing, monitoring, and observability of the RAG-LLM system.
 
+**Implemented and working (2026):** OpenTelemetry OTLP export to Langfuse, Langfuse attribute mapping, OCSF event mapping for guard results and pipeline timing, and optional local JSONL for security events. For the full defense architecture (which guards feed into these traces), see the root [README.md](../README.md) section **Defense Architecture (2026 State of the Art)**.
+
 ## Architecture
 
 ### System Overview

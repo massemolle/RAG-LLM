@@ -86,36 +86,34 @@ def get_langfuse_client():
     return _langfuse_client
 
 
-# PII patterns for anonymization (order matters - more specific first)
-PII_PATTERNS = [
-    ("credit_card", r'\b\d{4}[\s.-]?\d{4}[\s.-]?\d{4}[\s.-]?\d{4}\b'),
-    ("iban", r'\b[A-Z]{2}\d{2}[A-Z0-9]{4}\d{7}([A-Z0-9]?){0,16}\b'),
-    ("phone_lux", r'\+352[\s.-]?\d{2}[\s.-]?\d{3}[\s.-]?\d{3}\b'),
-    ("phone_intl", r'\+\d{1,3}[\s.-]?\d{1,4}[\s.-]?\d{1,4}[\s.-]?\d{1,9}\b'),
-    ("ssn", r'\b\d{3}-\d{2}-\d{4}\b'),
-    ("email", r'\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}\b'),
-    ("api_key", r'\b(api[_-]?key|token|secret)[\s:=]+[\w\-]+'),
-]
-
-
 def anonymize_pii(text: str) -> str:
     """
-    Anonymize PII in text before logging
-    
+    Anonymize PII in text before logging.
+
+    Delegates to the shared ``utils.pii`` module for a consistent superset
+    of PII patterns across the entire codebase.
+
     Args:
-        text: Text to anonymize
-    
+        text: Text to anonymize.
+
     Returns:
-        Anonymized text
+        Anonymized text with PII replaced by ``[REDACTED_<TYPE>]``.
     """
     if not text:
         return text
-    
-    anonymized = text
-    for pii_type, pattern in PII_PATTERNS:
-        anonymized = re.sub(pattern, f"[REDACTED_{pii_type.upper()}]", anonymized, flags=re.IGNORECASE)
-    
-    return anonymized
+    try:
+        from utils.pii import redact_pii_regex
+        return redact_pii_regex(text)
+    except ImportError:
+        # Inline fallback (should not happen in normal operation)
+        _fallback = [
+            ("credit_card", r'\b\d{4}[\s.-]?\d{4}[\s.-]?\d{4}[\s.-]?\d{4}\b'),
+            ("email", r'\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}\b'),
+        ]
+        result = text
+        for pii_type, pattern in _fallback:
+            result = re.sub(pattern, f"[REDACTED_{pii_type.upper()}]", result, flags=re.IGNORECASE)
+        return result
 
 
 def create_trace(

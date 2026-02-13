@@ -311,16 +311,22 @@ class StructuredGuardrails:
         if unsafe_count > 0:
             violations.append("unsafe content detected")
         
-        # Check for PII in output
-        pii_patterns = [
-            r'\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}\b',
-            r'\b\d{3}-\d{2}-\d{4}\b',  # SSN
-            r'\b\d{4}[\s.-]?\d{4}[\s.-]?\d{4}[\s.-]?\d{4}\b',  # Credit card
-        ]
-        
-        pii_count = sum(1 for pattern in pii_patterns if re.search(pattern, response_lower))
-        if pii_count > 0:
-            violations.append(f"PII detected ({pii_count} instances)")
+        # Check for PII in output (uses shared utils.pii patterns)
+        try:
+            from utils.pii import detect_pii_regex
+            pii_entities, _ = detect_pii_regex(response)
+            if pii_entities:
+                pii_types = set(e["type"] for e in pii_entities)
+                violations.append(f"PII detected ({len(pii_entities)} instances: {', '.join(pii_types)})")
+        except ImportError:
+            _pii_pats = [
+                r'\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}\b',
+                r'\b\d{3}-\d{2}-\d{4}\b',
+                r'\b\d{4}[\s.-]?\d{4}[\s.-]?\d{4}[\s.-]?\d{4}\b',
+            ]
+            pii_count = sum(1 for p in _pii_pats if re.search(p, response_lower))
+            if pii_count > 0:
+                violations.append(f"PII detected ({pii_count} instances)")
         
         if violations:
             severity = Severity.REVIEW

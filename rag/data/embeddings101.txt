@@ -1,0 +1,3 @@
+Embeddings map tokens or documents to vectors in R^d.
+Cosine similarity is commonly used to compare embeddings.
+L2-normalization helps when using dot-product scoring. 

@@ -374,17 +374,22 @@ class FallbackLLMGuard:
     
     import re
     
-    # Basic patterns for fallback detection
-    INJECTION_PATTERNS = [
-        r'ignore\s+(all\s+)?previous\s+instructions',
-        r'disregard\s+(everything|all|your)',
-        r'forget\s+(your|all|previous)',
-        r'you\s+are\s+now\s+\w+',
-        r'pretend\s+(to\s+be|you\s+are)',
-        r'act\s+as\s+if',
-        r'system\s*:?\s*override',
-        r'</?(system|instructions|prompt)>',
-    ]
+    # Injection patterns — sourced from shared utils.injection_patterns
+    # when available, with a minimal inline fallback.
+    try:
+        from utils.injection_patterns import INJECTION_PATTERNS_FLAT as _shared
+        INJECTION_PATTERNS = [p.pattern for _, p, _, _ in _shared[:20]]
+    except ImportError:
+        INJECTION_PATTERNS = [
+            r'ignore\s+(all\s+)?previous\s+instructions',
+            r'disregard\s+(everything|all|your)',
+            r'forget\s+(your|all|previous)',
+            r'you\s+are\s+now\s+\w+',
+            r'pretend\s+(to\s+be|you\s+are)',
+            r'act\s+as\s+if',
+            r'system\s*:?\s*override',
+            r'</?(system|instructions|prompt)>',
+        ]
     
     SECRET_PATTERNS = [
         r'[a-zA-Z0-9]{20,}',  # Long alphanumeric strings (potential API keys)

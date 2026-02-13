@@ -191,62 +191,54 @@ async def log_interaction(
         **kwargs: Additional event fields
     """
     log_path = POLICY.get("logging", {}).get("path", "./logs/audit.jsonl")
-    os.makedirs(os.path.dirname(log_path), exist_ok=True)
-    
     log_entry = {
         "timestamp": datetime.utcnow().isoformat() + "Z",
         "event": event,
         **kwargs
     }
-    
     if data:
         log_entry["data"] = data
-    
-    # Write to log file
-    with open(log_path, "a", encoding="utf-8") as f:
-        f.write(json.dumps(log_entry, ensure_ascii=False) + "\n")
-    
+
+    try:
+        from utils.audit_logger import log_audit
+        log_audit(log_entry, log_path=log_path)
+    except ImportError:
+        os.makedirs(os.path.dirname(log_path), exist_ok=True)
+        with open(log_path, "a", encoding="utf-8") as f:
+            f.write(json.dumps(log_entry, ensure_ascii=False) + "\n")
+
     logger.info(f"Logged event: {event}")
 
 
 @action
 async def write_security_log(entry: Dict[str, Any]) -> None:
-    """
-    Custom action: Write to security log
-    
-    Args:
-        entry: Security log entry
-    """
+    """Write to security log — delegates to shared utils.audit_logger."""
     security_log_path = os.path.join(
-        os.path.dirname(__file__),
-        "logs",
-        "security.jsonl"
+        os.path.dirname(__file__), "logs", "security.jsonl"
     )
-    os.makedirs(os.path.dirname(security_log_path), exist_ok=True)
-    
-    with open(security_log_path, "a", encoding="utf-8") as f:
-        f.write(json.dumps(entry, ensure_ascii=False) + "\n")
-    
+    try:
+        from utils.audit_logger import log_security
+        log_security(entry, log_path=security_log_path)
+    except ImportError:
+        os.makedirs(os.path.dirname(security_log_path), exist_ok=True)
+        with open(security_log_path, "a", encoding="utf-8") as f:
+            f.write(json.dumps(entry, ensure_ascii=False) + "\n")
     logger.warning(f"Security event logged: {entry.get('event', 'unknown')}")
 
 
 @action
 async def write_audit_log(entry: Dict[str, Any]) -> None:
-    """
-    Custom action: Write to audit log
-    
-    Args:
-        entry: Audit log entry
-    """
+    """Write to audit log — delegates to shared utils.audit_logger."""
     audit_log_path = os.path.join(
-        os.path.dirname(__file__),
-        "logs",
-        "audit.jsonl"
+        os.path.dirname(__file__), "logs", "audit.jsonl"
     )
-    os.makedirs(os.path.dirname(audit_log_path), exist_ok=True)
-    
-    with open(audit_log_path, "a", encoding="utf-8") as f:
-        f.write(json.dumps(entry, ensure_ascii=False) + "\n")
+    try:
+        from utils.audit_logger import log_audit
+        log_audit(entry, log_path=audit_log_path)
+    except ImportError:
+        os.makedirs(os.path.dirname(audit_log_path), exist_ok=True)
+        with open(audit_log_path, "a", encoding="utf-8") as f:
+            f.write(json.dumps(entry, ensure_ascii=False) + "\n")
 
 
 @action

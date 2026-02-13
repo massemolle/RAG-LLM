@@ -272,7 +272,7 @@ class GlobalRateLimiter:
     
     def __init__(
         self,
-        global_max_per_minute: int = 100,
+        global_max_per_minute: int = 60,
         suspicious_max_per_minute: int = 5,
         llm_judge_max_per_minute: int = 10,
         session_ttl_seconds: int = 3600

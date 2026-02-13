@@ -83,15 +83,19 @@ class GuardrailsWrapper:
             r"(?i)show\s+me\s+your\s+instructions"
         ]
         
-        # PII patterns
-        self.pii_patterns = {
-            "email": r'\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}\b',
-            "phone_lux": r'\b(\+352)?\s?\d{3}[\s.-]?\d{3}[\s.-]?\d{3}\b',
-            "phone_intl": r'\b\+?\d{1,3}[\s.-]?\d{1,4}[\s.-]?\d{1,4}[\s.-]?\d{1,9}\b',
-            "credit_card": r'\b\d{4}[\s.-]?\d{4}[\s.-]?\d{4}[\s.-]?\d{4}\b',
-            "ssn": r'\b\d{3}-\d{2}-\d{4}\b',
-            "iban": r'\b[A-Z]{2}\d{2}[A-Z0-9]{4}\d{7}([A-Z0-9]?){0,16}\b'
-        }
+        # PII patterns — sourced from the shared utils.pii registry
+        try:
+            from utils.pii import PII_PATTERNS as _shared_pii
+            self.pii_patterns = {name: pat.pattern for name, pat in _shared_pii}
+        except ImportError:
+            self.pii_patterns = {
+                "email": r'\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}\b',
+                "phone_lux": r'\b(\+352)?\s?\d{3}[\s.-]?\d{3}[\s.-]?\d{3}\b',
+                "phone_intl": r'\b\+?\d{1,3}[\s.-]?\d{1,4}[\s.-]?\d{1,4}[\s.-]?\d{1,9}\b',
+                "credit_card": r'\b\d{4}[\s.-]?\d{4}[\s.-]?\d{4}[\s.-]?\d{4}\b',
+                "ssn": r'\b\d{3}-\d{2}-\d{4}\b',
+                "iban": r'\b[A-Z]{2}\d{2}[A-Z0-9]{4}\d{7}([A-Z0-9]?){0,16}\b',
+            }
     
     def check_jailbreak(self, text: str) -> Tuple[bool, int, List[str]]:
         """Check for jailbreak attempts"""

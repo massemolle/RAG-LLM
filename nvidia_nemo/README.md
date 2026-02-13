@@ -2,6 +2,8 @@
 
 This directory contains the production guardrails stack for the RAG chatbot: multi-layer input/output security, NeMo flows, policy framework, timing metrics, and observability (Langfuse/OpenTelemetry).
 
+**Implemented and working (2026):** All layers and guards listed below are active. For the full defense scheme (input/output guards, RAG defenses, rate limiting, prompt leakage, multi-turn, OCSF), see the root [README.md](../README.md) section **Defense Architecture (2026 State of the Art)**.
+
 ---
 
 ## Architecture Overview
@@ -21,9 +23,11 @@ The pipeline uses **speculative parallel execution**:
 | 1 | LLM Guard | Defensive scanners (prompt injection, toxicity, PII, etc.) |
 | 2 | NeMo (input guardrails) | 2-layer: deterministic patterns + NeMo jailbreak heuristics |
 | 3 | LLM Judge | Escalation-only model-based judge |
-| — | Output guards | Topic, PII, grounding, integrity, etc. |
+| — | Output guards | Topic, global, differential, integrity, IP, LLM Guard output, prompt leakage |
 
 All layers are timed; metrics are exposed to the UI and to Langfuse/OpenTelemetry.
+
+**Guards implemented here (code in `enhanced_guardrails.py`):** Input: `guard_embedding_similarity`, `guard_llm_guard`, `guard_topic_taxonomy`, `guard_input_security_3layer`, `guard_input_sentimental`, `guard_input_topic`. Output: `guard_output_topic`, `guard_output_global`, `guard_output_differential`, `guard_output_integrity`, `guard_output_ip`, `guard_output_llm_guard`, `guard_output_prompt_leakage`. Multi-turn: `_session_history`, `_format_conversation_history`, `_record_session_message`. Rate limit: `get_global_rate_limiter().check_global_limit()` at start of `answer()`.
 
 ---
 

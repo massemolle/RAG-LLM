@@ -25,10 +25,10 @@ from RagV2 import (
     get_llm_client, get_beamstudio_models, is_beamstudio_configured
 )
 from llm_client import LLMClient, LocalLLMClient, BeamStudioClient
-from rag_defense.ingest import run_ingest
-from rag_defense.safe_retrieval import SafeIndex
-from rag_defense.classification import DataClassification
-from rag_defense.index_versioning import list_versions, rollback_index
+from rag.ingest import run_ingest
+from rag.safe_retrieval import SafeIndex
+from rag.classification import DataClassification
+from rag.index_versioning import list_versions, rollback_index
 
 # Initialize OpenTelemetry with Langfuse exporter
 try:
@@ -82,66 +82,85 @@ if "safe_mode" not in st.session_state:
     st.session_state.safe_mode = policy.get("safe_mode", True)
 if "guardrails_mode" not in st.session_state:
     st.session_state.guardrails_mode = policy.get("guardrails_mode", "complete")
-if "policy_mode" not in st.session_state:
-    st.session_state.policy_mode = policy.get("mode", "monitor")
 
-c1, c2, c3, c4 = st.columns(4)
+GUARDRAILS_OPTIONS = [
+    ("Off (no guardrails)", "off"),
+    ("Classic (LLM judge only)", "classic"),
+    ("Complete (full pipeline)", "complete"),
+]
+_guardrails_labels = [x[0] for x in GUARDRAILS_OPTIONS]
+_guardrails_values = [x[1] for x in GUARDRAILS_OPTIONS]
+
+def _auto_save_policy():
+    """Persist current policy controls to policy.yaml and reload in-memory policy."""
+    # Read latest widget values from session state (on_change fires after state update)
+    _safe = st.session_state.get("safe_mode_checkbox", True)
+    _cos = st.session_state.get("cite_or_silent_checkbox", True)
+    _gr_label = st.session_state.get("guardrails_mode_select", "Complete (full pipeline)")
+    _gr_value = _guardrails_values[_guardrails_labels.index(_gr_label)] if _gr_label in _guardrails_labels else "complete"
+
+    # Update session state mirrors
+    st.session_state.safe_mode = _safe
+    st.session_state.cite_or_silent = _cos
+    st.session_state.guardrails_mode = _gr_value
+
+    # Write to disk
+    try:
+        with open("policy.yaml", "r", encoding="utf-8") as f:
+            _pol = yaml.safe_load(f) or {}
+    except FileNotFoundError:
+        _pol = {}
+    _pol["safe_mode"] = _safe
+    _pol.setdefault("output", {})["cite_or_silent"] = _cos
+    _pol["guardrails_mode"] = _gr_value
+    with open("policy.yaml", "w", encoding="utf-8") as f:
+        yaml.safe_dump(_pol, f)
+
+    # Reload in-memory policy
+    try:
+        from defense.guards import reload_policy, update_cite_or_silent
+        reload_policy()
+        update_cite_or_silent(_cos)
+    except ImportError:
+        pass
+
+c1, c2, c3 = st.columns(3)
 with c1:
-    mode = st.selectbox("Policy mode", ["off","monitor","strict"],
-                        index=["off","monitor","strict"].index(st.session_state.policy_mode),
-                        key="policy_mode_select")
-    st.session_state.policy_mode = mode
-with c2:
     safe_mode = st.checkbox("Safe mode (no tools; retrieval only)", 
                             value=st.session_state.safe_mode,
-                            key="safe_mode_checkbox")
+                            key="safe_mode_checkbox",
+                            on_change=_auto_save_policy,
+                            help="When enabled, disables tool use and restricts the assistant to retrieval-only answers from the knowledge base.")
     st.session_state.safe_mode = safe_mode
-with c3:
-    # Cite-or-silent: ON = only answer from docs, OFF = always answer
+with c2:
     cite_or_silent = st.checkbox(
-        "Cite-or-silent", 
+        "Restrict to documents only",
         value=st.session_state.cite_or_silent,
         key="cite_or_silent_checkbox",
-        help="ON: Only answer if info found in documents. OFF: Always answer using LLM."
+        on_change=_auto_save_policy,
+        help="ON: Only answer from indexed documents — refuses if no relevant source is found. OFF: Answer any question, using documents when available."
     )
     st.session_state.cite_or_silent = cite_or_silent
     # Update in-memory policy immediately when checkbox changes
     from defense.guards import update_cite_or_silent
     update_cite_or_silent(cite_or_silent)
-with c4:
-    GUARDRAILS_OPTIONS = [
-        ("Off (no guardrails)", "off"),
-        ("Classic (LLM judge only)", "classic"),
-        ("Complete (full pipeline)", "complete"),
-    ]
-    labels = [x[0] for x in GUARDRAILS_OPTIONS]
-    values = [x[1] for x in GUARDRAILS_OPTIONS]
+with c3:
     current_mode = st.session_state.guardrails_mode
-    idx = values.index(current_mode) if current_mode in values else 2  # default Complete
+    idx = _guardrails_values.index(current_mode) if current_mode in _guardrails_values else 2  # default Complete
     guardrails_mode_label = st.selectbox(
         "Guardrails",
-        labels,
+        _guardrails_labels,
         index=idx,
         key="guardrails_mode_select",
-        help="Off: classic API only. Classic: LLM judge for input and output. Complete: full pipeline."
+        on_change=_auto_save_policy,
+        help="Off: no guardrails, direct API call. Classic: 5 LLM judges for input/output safety. Complete: full multi-layer pipeline (embedding, LLM Guard, NeMo, LLM judges)."
     )
-    st.session_state.guardrails_mode = values[labels.index(guardrails_mode_label)]
-
-if st.button("Save policy"):
-    policy["mode"] = mode
-    policy["safe_mode"] = safe_mode
-    policy.setdefault("output", {})["cite_or_silent"] = cite_or_silent
-    policy["guardrails_mode"] = st.session_state.guardrails_mode
-    with open("policy.yaml","w",encoding="utf-8") as f:
-        yaml.safe_dump(policy, f)
-    # Reload the in-memory POLICY so changes take effect immediately
-    from defense.guards import reload_policy
-    reload_policy()
-    st.success("policy.yaml saved and applied.")
+    st.session_state.guardrails_mode = _guardrails_values[_guardrails_labels.index(guardrails_mode_label)]
 
 # --- Device selection ---
 available_devices = list_devices()
-selected_device = st.selectbox("Computation device", available_devices)
+selected_device = st.selectbox("Computation device", available_devices,
+                               help="Select the hardware device for local model inference (CPU or CUDA GPU).")
 st.session_state.device = selected_device
 
 # --- RAG model instance ---
@@ -149,8 +168,10 @@ st.session_state.device = selected_device
 def _get_rag(method, device_sel):
     return RAG(method=method, device=device_sel)
 
-mode_sel = st.selectbox('Select running mode', ['User BM25', 'Developer BERT'])
-method = 'BM25' if mode_sel == 'User BM25' else st.selectbox('RAG methods', ['Default', 'BERT', 'BM25'])
+mode_sel = st.selectbox('Select running mode', ['User BM25', 'Developer BERT'],
+                        help="User BM25: fast keyword-based retrieval (recommended). Developer BERT: semantic retrieval using BERT embeddings (slower).")
+method = 'BM25' if mode_sel == 'User BM25' else st.selectbox('RAG methods', ['Default', 'BERT', 'BM25'],
+                                                               help="The embedding method used to match your query against documents. BM25 is fastest; BERT uses neural embeddings.")
 
 if 'rag_model' not in st.session_state or st.session_state.get('name') != method:
     st.session_state.rag_model = _get_rag(method, selected_device)
@@ -201,7 +222,8 @@ else:
     st.info("ℹ️ BeamStudio API not configured - set BEAMSTUDIO_API_KEY in .env for cloud models")
 
 # Default to BeamStudio gpt-5.1 (index 1: first option is "Please select LLM model")
-llm_name = st.selectbox("Select LLM (or 'Other')", all_models, index=1)
+llm_name = st.selectbox("Select LLM (or 'Other')", all_models, index=1,
+                        help="Choose the language model. BeamStudio models are cloud-hosted; 'Other' lets you specify a local HuggingFace model.")
 
 if llm_name != 'Please select LLM model':
     # Check if selection changed
@@ -238,7 +260,8 @@ if llm_name != 'Please select LLM model':
                     except Exception as e:
                         st.error(f"❌ Failed to connect to BeamStudio: {e}")
         elif llm_name == 'Other':
-            llm_path = st.text_input('Provide Hugging Face model id')
+            llm_path = st.text_input('Provide Hugging Face model id',
+                                     help="Enter a HuggingFace model identifier, e.g. 'Qwen/Qwen2-0.5B'. The model will be downloaded on first use.")
             if llm_path:
                 validated_name = get_llm(llm_path)
                 with st.spinner(f"Loading local model: {validated_name}..."):
@@ -273,8 +296,10 @@ if st.session_state.get('current_llm_name'):
 st.divider()
 st.subheader("1) Approved documents")
 
-path_to_dir = st.text_input('Folder with raw docs (.pdf, .docx, .txt)', './database')
-collection = st.text_input('Collection name', 'grid_ops')
+path_to_dir = st.text_input('Folder with raw docs (.pdf, .docx, .txt)', './rag/data',
+                            help="Path to the folder containing your source documents (.pdf, .docx, .txt). These will be scanned, classified, and indexed.")
+collection = st.text_input('Collection name', 'grid_ops',
+                           help="A label for this set of documents in the index. Used to group and identify chunks from the same ingestion batch.")
 
 # Data classification selector
 classification_options = ["auto (folder-based)"] + [dc.value for dc in DataClassification]
@@ -288,7 +313,7 @@ _explicit_class = None if selected_class.startswith("auto") else selected_class
 
 c_ing1, c_ing2 = st.columns([1, 1])
 with c_ing1:
-    if st.button("Run Safe Ingest"):
+    if st.button("Run Safe Ingest", help="Scan documents for threats (injections, PII, hidden content), classify them, and build a secure search index."):
         with st.spinner("Scanning and ingesting documents..."):
             res = run_ingest(
                 src=path_to_dir,
@@ -359,9 +384,10 @@ if _last_ingest and _last_ingest.get("scan_summary"):
             st.caption(f"Total flags across all files: **{total_flags}**")
 
 with c_ing2:
-    man = "./safe_index/manifest.json"
+    man = "./rag/index/manifest.json"
     if os.path.exists(man):
-        st.download_button("Download manifest.json", open(man, "rb"), file_name="manifest.json")
+        st.download_button("Download manifest.json", open(man, "rb"), file_name="manifest.json",
+                           help="Download the ingestion manifest containing file list, chunk counts, scan results, and provenance metadata.")
 
 _idx = SafeIndex()
 st.info(f"Safe index: **{len(_idx.records)}** chunks indexed.")
@@ -375,24 +401,14 @@ if _versions:
             chunks = v.get("chunks", "?")
             created = v.get("created", "?")
             st.caption(f"**{label}** — {chunks} chunks — {created}")
-        rb_label = st.selectbox("Rollback to version", [v.get("label", "") for v in _versions], key="rb_version")
-        if st.button("Rollback"):
+        rb_label = st.selectbox("Rollback to version", [v.get("label", "") for v in _versions], key="rb_version",
+                                help="Select a previous index snapshot to restore. The current index is backed up before rollback.")
+        if st.button("Rollback", help="Restore the selected index version. Your current index is automatically saved as a new snapshot first."):
             if rollback_index(rb_label):
                 safe_idx.reload()
                 st.success(f"Rolled back to version {rb_label}. Index reloaded.")
             else:
                 st.error(f"Rollback failed for version {rb_label}.")
-
-# Optional: legacy retriever population (keeps your previous flow)
-if st.button("Process with legacy retriever (optional)"):
-    try:
-        from model.database import doc2Text
-        data = doc2Text(path_to_dir)
-        st.session_state.rag_model.model.process(doc=data, path=path_to_dir)
-        st.session_state.rag_model.path = os.path.abspath(path_to_dir)
-        st.success("Legacy retriever processed (BM25/BERT).")
-    except Exception as e:
-        st.error(f"Legacy process failed: {e}")
 
 st.divider()
 st.subheader("2) Chat")
@@ -525,7 +541,7 @@ if prompt:
                         st.markdown("**📊 Per-guard breakdown**")
                         if is_classic:
                             guard_labels_input = {"input-sentimental": "Input sentimental", "input-security": "Input security", "input-topic": "Input topic"}
-                            guard_labels_output = {"output-topic": "Output topic", "output-global": "Output global"}
+                            guard_labels_output = {"output-topic": "Output topic", "output-global": "Output global", "output-llm-guard": "Output LLM Guard", "output-prompt-leakage": "Prompt leakage"}
                         else:
                             guard_labels_input = {
                                 "embedding-similarity": "Embedding similarity",
@@ -541,6 +557,8 @@ if prompt:
                                 "output-integrity": "Output integrity",
                                 "output-ip": "Output IP",
                                 "output-global": "Output global",
+                                "output-llm-guard": "Output LLM Guard",
+                                "output-prompt-leakage": "Prompt leakage",
                             }
                         
                         # Input guards deep dive
@@ -704,15 +722,28 @@ if prompt:
                 st.caption(f"⏱️ **Response time:** {_total_ms:.0f} ms")
         else:
             # Guardrails off: direct RAG, still show time and token usage
+            # Global rate limit check (even without guardrails)
+            _rate_limited = False
+            try:
+                from nvidia_nemo.production_hardening import get_global_rate_limiter
+                _rl_ok, _rl_reason = get_global_rate_limiter().check_global_limit()
+                if not _rl_ok:
+                    _rate_limited = True
+                    answ = "Rate limit exceeded. Please wait before sending another query."
+                    st.warning(f"⚠️ {_rl_reason}")
+            except ImportError:
+                pass
+
             user_id = f"user_{st.session_state.session_id[:8]}"
             import time as _time
             _t0 = _time.perf_counter()
-            answ = st.session_state.rag_model.answer(
-                prompt,
-                role="analyst",
-                user_id=user_id,
-                session_id=st.session_state.session_id
-            )
+            if not _rate_limited:
+                answ = st.session_state.rag_model.answer(
+                    prompt,
+                    role="analyst",
+                    user_id=user_id,
+                    session_id=st.session_state.session_id
+                )
             _elapsed_ms = (_time.perf_counter() - _t0) * 1000
             # Show response time prominently
             st.caption(f"⏱️ **Response time:** {_elapsed_ms:.0f} ms")
@@ -735,4 +766,4 @@ if prompt:
         st.markdown(answ)
     st.session_state.messages.append({"role":"assistant","content":answ})
 
-st.caption("Transparency: Answers cite approved sources when used. If no relevant source exists, the assistant may answer generally (policy-controlled).")
+st.caption("Transparency: Answers cite approved sources when used. If 'Restrict to documents only' is off, the assistant may answer generally.")

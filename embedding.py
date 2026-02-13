@@ -1,3 +1,12 @@
+"""
+Embedding Methods
+=================
+
+Provides BM25 and BERT-based embedding classes for document retrieval.
+Each class implements ``retrieve(query, path, doc)`` and
+``process(doc, path, get)`` methods following the ``Method`` template.
+"""
+
 import bm25s
 import os
 from transformers import BertTokenizerFast, BertModel

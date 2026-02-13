@@ -2,7 +2,7 @@ allow_collections:
 - grid_ops
 - safety_bulletins
 allow_dirs:
-- C:/Users/user/Documents/GitHub/RAG-LLM/database
+- ./rag/data
 blocked_patterns:
   pii:
   - \b[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}\b
@@ -19,7 +19,6 @@ logging:
   - user_query
   - tool_args
   retention_days: 30
-mode: monitor
 output:
   allow_general_if_no_docs: true
   auto_cite_if_missing: true
